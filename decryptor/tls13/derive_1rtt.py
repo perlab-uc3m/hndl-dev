@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""TLS 1.3 1-RTT key derivation from captured handshakes."""
+
+import binascii
+import hashlib
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives import serialization
+
+from ..core import (
+    derive_tls13_keys_with_trace,
+    compute_shared_secret_from_priv_and_peer,
+    hkdf_expand_label,
+    get_hash_algo,
+    nss_tls13_key_log_line,
+    parse_tls13_handshake_secrets_from_keylog,
+    print_secret_comparison,
+    sha_hex,
+    compute_th_finished,
+)
+from ..io import (
+    CapturePaths,
+    load_ephemeral_keys,
+    save_diagnostics,
+    save_key_schedule_trace,
+    save_transcript_hashes,
+    save_handshake_messages,
+    load_th_finished,
+    save_th_finished,
+    find_first_frame,
+    hexdump_frame,
+    extract_first_handshake_message,
+    iter_tcp_payloads,
+    parse_first_handshake_from_payload,
+    list_tcp_stream_indices,
+    get_tcp_stream_bytes,
+    parse_client_random_from_ch,
+    parse_cipher_from_server_hello,
+    parse_client_keyshare_pub_from_ch,
+    parse_server_keyshare_pub_from_sh,
+    extract_decrypted_handshake_from_tshark,
+)
+
+
+def _check_tool(name: str):
+    if shutil.which(name) is None:
+        sys.exit(f"Required tool '{name}' not found in PATH")
+
+
+def _x25519_pub_from_priv(hexstr: str) -> bytes:
+    pk = x25519.X25519PrivateKey.from_private_bytes(binascii.unhexlify(hexstr))
+    return pk.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
+    )
+
+
+def _extract_hello_messages(paths: CapturePaths, port: int, debug: bool):
+    """Extract ClientHello and ServerHello from PCAP."""
+    f_ch = find_first_frame(paths.pcap, "tls.handshake.type==1", port)
+    f_sh = find_first_frame(paths.pcap, "tls.handshake.type==2", port)
+
+    ch = sh = None
+    if f_ch and f_sh:
+        try:
+            fb_ch = hexdump_frame(paths.pcap, f_ch, port)
+            ch = extract_first_handshake_message(fb_ch, expected_type=1)
+            fb_sh = hexdump_frame(paths.pcap, f_sh, port)
+            sh = extract_first_handshake_message(fb_sh, expected_type=2)
+        except Exception:
+            ch = sh = None
+
+    # Fallback: scan TCP payloads
+    if ch is None or sh is None:
+        for _, payload in iter_tcp_payloads(paths.pcap, port):
+            if ch is None:
+                ch = parse_first_handshake_from_payload(payload, expected_type=1)
+            if sh is None:
+                sh = parse_first_handshake_from_payload(payload, expected_type=2)
+            if ch and sh:
+                break
+
+    # Fallback: stream reassembly
+    if ch is None or sh is None:
+        for stream_idx in list_tcp_stream_indices(paths.pcap, port):
+            try:
+                c2s, s2c = get_tcp_stream_bytes(paths.pcap, stream_idx)
+            except Exception:
+                continue
+            if ch is None:
+                ch = parse_first_handshake_from_payload(
+                    c2s, expected_type=1
+                ) or parse_first_handshake_from_payload(s2c, expected_type=1)
+            if sh is None:
+                sh = parse_first_handshake_from_payload(
+                    s2c, expected_type=2
+                ) or parse_first_handshake_from_payload(c2s, expected_type=2)
+            if ch and sh:
+                break
+
+    return ch, sh
+
+
+def _select_ephemeral_keys(server_e: dict, client_e: dict, role: str, debug: bool):
+    """Select which ephemeral keys to use based on role."""
+    if role in ("auto", "server"):
+        priv_hex = server_e.get("priv")
+        peer_pub_hex = client_e.get("pub")
+        if not priv_hex and client_e.get("priv") and server_e.get("pub"):
+            priv_hex = client_e.get("priv")
+            peer_pub_hex = server_e.get("pub")
+    else:
+        priv_hex = client_e.get("priv")
+        peer_pub_hex = server_e.get("pub")
+        if not priv_hex and server_e.get("priv") and client_e.get("pub"):
+            priv_hex = server_e.get("priv")
+            peer_pub_hex = client_e.get("pub")
+
+    return priv_hex, peer_pub_hex
+
+
+def _compute_th_finished(
+    pcap_file: Path,
+    keylog_file: Path,
+    ch: bytes,
+    sh: bytes,
+    hash_algo: str,
+    debug: bool,
+) -> bytes:
+    """Decrypt handshake and compute th_finished."""
+    encrypted_msgs = extract_decrypted_handshake_from_tshark(
+        pcap_file, keylog_file, debug=debug
+    )
+    if not encrypted_msgs:
+        return None
+
+    transcript = ch + sh
+    for msg in encrypted_msgs:
+        transcript += msg
+        if msg[0] == 20:  # Stop after first Finished
+            break
+
+    return compute_th_finished(transcript, hash_algo)
+
+
+def derive_1rtt(
+    capture_dir: Path,
+    pcap_name: str = "pcap/tls13_1rtt.pcapng",
+    port: int = 44443,
+    role: str = "server",
+    curve: str = "x25519",
+    hash_algo: str = "auto",
+    debug: bool = False,
+) -> dict:
+    """Derive TLS 1.3 1-RTT session keys from capture (RFC 8446)."""
+    _check_tool("tshark")
+
+    paths = CapturePaths(capture_dir, pcap_name)
+    if not paths.pcap_exists():
+        return {"success": False, "error": f"PCAP not found: {paths.pcap}"}
+
+    # Load ephemeral keys
+    server_e, client_e = load_ephemeral_keys(paths.capture_dir)
+    priv_hex, peer_pub_hex = _select_ephemeral_keys(server_e, client_e, role, debug)
+
+    if not priv_hex or not peer_pub_hex:
+        return {"success": False, "error": "Missing ephemeral keys"}
+
+    # Extract CH/SH
+    ch, sh = _extract_hello_messages(paths, port, debug)
+    if not ch or not sh:
+        return {"success": False, "error": "Could not extract ClientHello/ServerHello"}
+
+    # Detect hash from cipher suite
+    tls_hash = hash_algo
+    if tls_hash == "auto":
+        try:
+            cs = parse_cipher_from_server_hello(sh)
+            tls_hash = "sha384" if cs == 0x1302 else "sha256"
+        except Exception:
+            tls_hash = "sha256"
+
+    # Parse client random and keyshares
+    client_random = parse_client_random_from_ch(ch)
+    try:
+        ch_pub = parse_client_keyshare_pub_from_ch(ch)
+        sh_pub = parse_server_keyshare_pub_from_sh(sh)
+    except Exception:
+        ch_pub = sh_pub = None
+
+    # Compute shared secret Z
+    if ch_pub and server_e.get("priv"):
+        Z = compute_shared_secret_from_priv_and_peer(
+            server_e["priv"], binascii.hexlify(ch_pub).decode(), curve
+        )
+    elif sh_pub and client_e.get("priv"):
+        Z = compute_shared_secret_from_priv_and_peer(
+            client_e["priv"], binascii.hexlify(sh_pub).decode(), curve
+        )
+    else:
+        Z = compute_shared_secret_from_priv_and_peer(priv_hex, peer_pub_hex, curve)
+
+    # Compute th_hello
+    th_hello = hashlib.new(tls_hash, ch + sh).digest()
+
+    # Load OpenSSL keylog for verification
+    keylog_truth = {}
+    if paths.openssl_keylog_exists():
+        keylog_truth = parse_tls13_handshake_secrets_from_keylog(
+            paths.openssl_keylog, client_random
+        )
+
+    # Derive handshake secrets
+    derived_hs, trace_hs, derived_hs_hex = derive_tls13_keys_with_trace(
+        Z, hash_name=tls_hash, th_hello=th_hello, th_finished=None
+    )
+
+    paths.ensure_derived_dir()
+
+    # Write handshake-only keylog for decrypting rest of handshake
+    tmp_keylog = Path(tempfile.gettempdir()) / "tls13_handshake.keylog"
+    with tmp_keylog.open("w") as f:
+        f.write(
+            nss_tls13_key_log_line(
+                "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+                client_random,
+                derived_hs["client_handshake_traffic_secret"],
+            )
+        )
+        f.write(
+            nss_tls13_key_log_line(
+                "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+                client_random,
+                derived_hs["server_handshake_traffic_secret"],
+            )
+        )
+
+    # Compute th_finished
+    th_finished = _compute_th_finished(paths.pcap, tmp_keylog, ch, sh, tls_hash, debug)
+
+    if not th_finished:
+        # Handshake-only output
+        with paths.nss_derived_keylog.open("w") as f:
+            f.write(
+                nss_tls13_key_log_line(
+                    "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+                    client_random,
+                    derived_hs["client_handshake_traffic_secret"],
+                )
+            )
+            f.write(
+                nss_tls13_key_log_line(
+                    "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+                    client_random,
+                    derived_hs["server_handshake_traffic_secret"],
+                )
+            )
+        print(f"TLS 1.3 keys: PARTIAL (handshake only)")
+        print(f"Output: {paths.nss_derived_keylog}")
+        return {
+            "success": False,
+            "keylog_path": str(paths.nss_derived_keylog),
+            "handshake_only": True,
+        }
+
+    # Derive full key schedule including application secrets
+    derived, trace, derived_hex = derive_tls13_keys_with_trace(
+        Z, hash_name=tls_hash, th_hello=th_hello, th_finished=th_finished
+    )
+
+    # Write full keylog
+    with paths.nss_derived_keylog.open("w") as f:
+        f.write(
+            nss_tls13_key_log_line(
+                "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+                client_random,
+                derived["client_handshake_traffic_secret"],
+            )
+        )
+        f.write(
+            nss_tls13_key_log_line(
+                "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+                client_random,
+                derived["server_handshake_traffic_secret"],
+            )
+        )
+        f.write(
+            nss_tls13_key_log_line(
+                "CLIENT_TRAFFIC_SECRET_0",
+                client_random,
+                derived["client_application_traffic_secret"],
+            )
+        )
+        f.write(
+            nss_tls13_key_log_line(
+                "SERVER_TRAFFIC_SECRET_0",
+                client_random,
+                derived["server_application_traffic_secret"],
+            )
+        )
+
+    # Verify against OpenSSL keylog
+    derived_map = {
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET": derived_hex[
+            "client_handshake_traffic_secret"
+        ],
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET": derived_hex[
+            "server_handshake_traffic_secret"
+        ],
+        "CLIENT_TRAFFIC_SECRET_0": derived_hex["client_application_traffic_secret"],
+        "SERVER_TRAFFIC_SECRET_0": derived_hex["server_application_traffic_secret"],
+    }
+    ok, total = print_secret_comparison(
+        "TLS 1.3", keylog_truth, derived_map, verbose=debug
+    )
+
+    # Save trace
+    save_key_schedule_trace(paths.derived_dir, trace, "key_schedule_trace.json", debug)
+
+    status = "ALL MATCH" if ok == total else f"{ok}/{total} MATCH"
+    print(f"TLS 1.3 keys: {status} ({total} secrets)")
+    print(f"Output: {paths.nss_derived_keylog}")
+
+    return {
+        "success": ok == total,
+        "keylog_path": str(paths.nss_derived_keylog),
+        "secrets": derived_hex,
+    }

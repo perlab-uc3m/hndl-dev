@@ -1,0 +1,299 @@
+# OpenSSL 3.6.0 QUIC Server Demo Patch
+#
+# Extends the upstream demos/quic/server/server.c with the minimal additions
+# needed for the HN-DL capture pipeline:
+#
+#   - NSS keylog callback (-k <path>)   → ground-truth verification
+#   - Configurable response size (-n N) → α measurements at varying payloads
+#   - Group selection (-g <groups>)     → test different curves
+#   - One-shot mode (-1)               → scripted capture
+#   - SO_REUSEADDR on UDP socket       → rapid test re-runs
+#   - getopt-based CLI replacing positional args
+#
+# These additions total ~80 lines of straightforward C.  The rest of the
+# upstream demo (SSL_new_listener, ALPN, blocking accept loop) is unchanged.
+#
+# Apply:
+#   cd openssl/src/openssl
+#   patch -p1 < ../../../patches/openssl-3.6.0-quic-server.patch
+#
+# Build:
+#   bash scripts/build_quic_server.sh
+#
+--- a/demos/quic/server/server.c	2025-11-07 11:34:42.590618300 +0100
++++ b/demos/quic/server/server.c	2026-02-24 00:01:49.274291461 +0100
+@@ -6,12 +6,23 @@
+  * in the file LICENSE in the source distribution or at
+  * https://www.openssl.org/source/license.html
+  */
++
++/*
++ * HN-DL patch additions (see patches/openssl-3.6.0-quic-server.patch):
++ *   -k <path>   Write NSS keylog for ground-truth verification
++ *   -n <bytes>  Response payload size (default 256)
++ *   -g <groups> TLS 1.3 groups (default X25519)
++ *   -1          Exit after one connection (scripted capture)
++ */
++
+ #include <openssl/err.h>
+ #include <openssl/ssl.h>
+ #include <openssl/quic.h>
+ #ifdef _WIN32 /* Windows */
+ # include <winsock2.h>
+ #else /* Linux/Unix */
++# include <getopt.h>
++# include <stdlib.h>
+ # include <netinet/in.h>
+ # include <unistd.h>
+ #endif
+@@ -22,6 +33,18 @@
+  * a time is accepted in a blocking loop.
+  */
+ 
++/* ---- Keylog callback -------------------------------------------------- */
++
++static FILE *keylog_fp = NULL;
++
++static void keylog_callback(const SSL *ssl, const char *line)
++{
++    if (keylog_fp == NULL)
++        return;
++    fprintf(keylog_fp, "%s\n", line);
++    fflush(keylog_fp);
++}
++
+ /* ALPN string for TLS handshake */
+ static const unsigned char alpn_ossltest[] = {
+     /* "\x08ossltest" (hex for EBCDIC resilience) */
+@@ -43,7 +66,8 @@
+ }
+ 
+ /* Create SSL_CTX. */
+-static SSL_CTX *create_ctx(const char *cert_path, const char *key_path)
++static SSL_CTX *create_ctx(const char *cert_path, const char *key_path,
++                           const char *keylog_path, const char *groups)
+ {
+     SSL_CTX *ctx;
+ 
+@@ -69,6 +93,23 @@
+ 
+     /* Setup ALPN negotiation callback. */
+     SSL_CTX_set_alpn_select_cb(ctx, select_alpn, NULL);
++
++    /* TLS 1.3 groups (default X25519) */
++    if (groups && !SSL_CTX_set1_groups_list(ctx, groups)) {
++        fprintf(stderr, "failed to set groups: %s\n", groups);
++        goto err;
++    }
++
++    /* Keylog callback for ground-truth verification */
++    if (keylog_path) {
++        keylog_fp = fopen(keylog_path, "a");
++        if (!keylog_fp) {
++            fprintf(stderr, "cannot open keylog: %s\n", keylog_path);
++            goto err;
++        }
++        SSL_CTX_set_keylog_callback(ctx, keylog_callback);
++    }
++
+     return ctx;
+ 
+ err:
+@@ -87,6 +128,9 @@
+         goto err;
+     }
+ 
++    int reuse = 1;
++    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
++
+     sa.sin_family  = AF_INET;
+     sa.sin_port    = htons(port);
+ 
+@@ -105,39 +149,56 @@
+ }
+ 
+ /* Main loop for servicing a single incoming QUIC connection. */
+-static int run_quic_conn(SSL *conn)
++static int run_quic_conn(SSL *conn, size_t response_size)
+ {
+-    size_t written = 0;
++    char buf[4096];
++    size_t readbytes = 0;
+ 
+     fprintf(stderr, "=> Received connection\n");
+ 
++    /* Read client request (blocking, best-effort) */
++    if (SSL_read_ex(conn, buf, sizeof(buf), &readbytes))
++        fprintf(stderr, "=> Read %zu bytes from client\n", readbytes);
++
++    /* Build response payload of requested size */
++    char *response = malloc(response_size);
++    if (!response) {
++        fprintf(stderr, "malloc(%zu) failed\n", response_size);
++        return 0;
++    }
++    memset(response, 'A', response_size);
++
+     /*
+-     * Write the message "hello" on the connection using a default stream
+-     * and then immediately conclude the stream (end-of-stream). This
+-     * demonstrates the use of SSL_write_ex2 for optimised FIN generation.
+-     *
+-     * Since we inherit our blocking mode from the parent QUIC SSL object (the
+-     * listener) by default, this call is also blocking.
++     * Write the response on the connection using a default stream
++     * and conclude the stream (end-of-stream) with the final chunk.
+      */
+-    if (!SSL_write_ex2(conn, "hello\n", 6, SSL_WRITE_FLAG_CONCLUDE, &written)
+-        || written != 6) {
+-        fprintf(stderr, "couldn't write on connection\n");
+-        ERR_print_errors_fp(stderr);
+-        return 0;
++    size_t written = 0, total = 0;
++    while (total < response_size) {
++        size_t chunk = response_size - total;
++        if (!SSL_write_ex2(conn, response + total, chunk,
++                           (total + chunk >= response_size)
++                               ? SSL_WRITE_FLAG_CONCLUDE : 0,
++                           &written)) {
++            fprintf(stderr, "write failed at offset %zu\n", total);
++            ERR_print_errors_fp(stderr);
++            free(response);
++            return 0;
++        }
++        total += written;
+     }
++    fprintf(stderr, "=> Wrote %zu bytes to client\n", total);
++    free(response);
+ 
+     /* Shut down the connection (blocking). */
+-    if (SSL_shutdown(conn) != 1) {
+-        ERR_print_errors_fp(stderr);
+-        return 0;
+-    }
++    SSL_shutdown(conn);
+ 
+     fprintf(stderr, "=> Finished with connection\n");
+     return 1;
+ }
+ 
+ /* Main loop for server to accept QUIC connections. */
+-static int run_quic_server(SSL_CTX *ctx, int fd)
++static int run_quic_server(SSL_CTX *ctx, int fd,
++                           size_t response_size, int one_shot)
+ {
+     int ok = 0;
+     SSL *listener = NULL, *conn = NULL;
+@@ -171,22 +232,20 @@
+         }
+ 
+         /*
+-         * Optionally, we could disable blocking mode on the accepted connection
+-         * here by calling SSL_set_blocking_mode().
+-         */
+-
+-        /*
+          * Service the connection. In a real application this would be done
+          * concurrently. In this demonstration program a single connection is
+          * accepted and serviced at a time.
+          */
+-        if (!run_quic_conn(conn)) {
++        if (!run_quic_conn(conn, response_size)) {
+             SSL_free(conn);
+             goto err;
+         }
+ 
+         /* Free the connection, then loop again, accepting another connection. */
+         SSL_free(conn);
++
++        if (one_shot)
++            break;
+     }
+ 
+     ok = 1;
+@@ -198,35 +257,63 @@
+     return ok;
+ }
+ 
++static void usage(const char *argv0)
++{
++    fprintf(stderr,
++        "Usage: %s -p <port> -c <cert> -K <key> [options]\n"
++        "  -p <port>       UDP port to listen on\n"
++        "  -c <cert>       Certificate PEM file\n"
++        "  -K <key>        Private key PEM file\n"
++        "  -k <keylog>     Write NSS keylog to file\n"
++        "  -n <bytes>      Response payload size (default: 256)\n"
++        "  -g <groups>     TLS 1.3 groups (default: X25519)\n"
++        "  -1              Exit after one connection\n"
++        "  -h              Show this help\n",
++        argv0);
++}
++
+ int main(int argc, char **argv)
+ {
+     int rc = 1;
+     SSL_CTX *ctx = NULL;
+     int fd = -1;
+-    unsigned long port;
++    uint16_t port = 0;
++    const char *cert = NULL, *key = NULL, *keylog = NULL, *groups = "X25519";
++    size_t response_size = 256;
++    int one_shot = 0, opt;
++
++    while ((opt = getopt(argc, argv, "p:c:K:k:n:g:1h")) != -1) {
++        switch (opt) {
++        case 'p': port = (uint16_t)atoi(optarg); break;
++        case 'c': cert = optarg; break;
++        case 'K': key = optarg; break;
++        case 'k': keylog = optarg; break;
++        case 'n': response_size = (size_t)atol(optarg); break;
++        case 'g': groups = optarg; break;
++        case '1': one_shot = 1; break;
++        case 'h': usage(argv[0]); return 0;
++        default:  usage(argv[0]); return 1;
++        }
++    }
+ 
+-    if (argc < 4) {
+-        fprintf(stderr, "usage: %s <port> <server.crt> <server.key>\n", argv[0]);
++    if (!port || !cert || !key) {
++        usage(argv[0]);
+         goto err;
+     }
+ 
+     /* Create SSL_CTX. */
+-    if ((ctx = create_ctx(argv[2], argv[3])) == NULL)
++    if ((ctx = create_ctx(cert, key, keylog, groups)) == NULL)
+         goto err;
+ 
+-    /* Parse port number from command line arguments. */
+-    port = strtoul(argv[1], NULL, 0);
+-    if (port == 0 || port > UINT16_MAX) {
+-        fprintf(stderr, "invalid port: %lu\n", port);
+-        goto err;
+-    }
+-
+     /* Create UDP socket. */
+-    if ((fd = create_socket((uint16_t)port)) < 0)
++    if ((fd = create_socket(port)) < 0)
+         goto err;
+ 
++    fprintf(stderr, "QUIC server listening on UDP port %u (response=%zu B)\n",
++            port, response_size);
++
+     /* Enter QUIC server connection acceptance loop. */
+-    if (!run_quic_server(ctx, fd))
++    if (!run_quic_server(ctx, fd, response_size, one_shot))
+         goto err;
+ 
+     rc = 0;
+@@ -239,5 +326,8 @@
+     if (fd != -1)
+         BIO_closesocket(fd);
+ 
++    if (keylog_fp)
++        fclose(keylog_fp);
++
+     return rc;
+ }

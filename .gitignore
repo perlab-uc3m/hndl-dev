@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Certificates and keys
+*.pem
+
+# Build artifacts (local OpenSSL/OpenSSH)
+/openssl
+/openssh
+
+# Capture data
+data/
