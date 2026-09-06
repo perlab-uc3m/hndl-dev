@@ -57,8 +57,13 @@ The two phases can also run independently:
 
 ```bash
 python3 hndl.py -p tls13 -m 1rtt --capture-only
-python3 hndl.py -p tls13 --decrypt-only data/2025-...-tls13-1rtt-capture
+python3 hndl.py recover data/2025-...-tls13-1rtt-capture
 ```
+
+Recovery reads the protocol, mode, capture port, archives, simulated-recovery
+input, comparison-only state, and expected outputs from `manifest.json`.
+`--decrypt-only` remains available for compatibility; any supplied protocol,
+mode, or port is treated as an assertion and must agree with the manifest.
 
 For a development check of every supported mode, run:
 
@@ -82,7 +87,10 @@ keylog format. SSH writes a JSON recovery record containing its reconstructed
 keys, authenticated-packet counts, oracle-release trace, and recovered channel
 data. Every capture writes `manifest.json` with exact commands, versions,
 machine details, the evidence boundary, and SHA-256 hashes of the relevant
-code, binaries, and evidence.
+code, binaries, and evidence. Successful recovery also writes
+`derived/recovery_provenance.json`, binding the result to hashes of the source
+manifest, passive archive, simulated quantum output, comparison-only inputs,
+and recovery implementation.
 
 ## How it works
 
@@ -99,6 +107,13 @@ TLS and QUIC success requires all expected derived secrets to match the
 comparison-only key log and tshark to recover the known application request or
 response. A missing key log, handshake-only result, or absent plaintext marker
 is a failure rather than a vacuous success.
+
+The public Python API uses `ExperimentConfig`, `CaptureResult`, and
+`RecoveryResult` from `experiment.py`. Capture and recovery dispatch directly
+in-process: the exact returned capture directory is used, so concurrent runs
+do not race through a “latest directory” lookup. A scope-bound process
+lifecycle finalizes registered dumpcap writers and terminates registered
+clients or servers after exceptional exits.
 
 The implemented classical test configurations are deliberately narrow:
 X25519 with TLS 1.3/QUIC, RSA key transport with `AES128-SHA` for TLS 1.2, and
@@ -128,6 +143,8 @@ ground-truth file does not affect recovery.
 
 ```text
 hndl.py                 Main entrypoint
+experiment.py           Typed config/results and manifest validation
+pyproject.toml          Dependencies, console entry point, formatting/tests
 capture/
     capture.py          Capture CLI
     tls13/              1-RTT and 0-RTT capture
@@ -145,6 +162,7 @@ decryptor/
 analysis/               Cost models, mitigation experiments, figures
     results/            CSV data from experiments
 scripts/                Build scripts and the all-mode integration smoke test
+tests/                  Fast public manifest, dispatch, and cleanup tests
 patches/                Source patches
 ```
 
@@ -172,4 +190,11 @@ with mode `0600` only for that subprocess invocation.
 
 ```bash
 black .
+```
+
+Install the development tools and run the fast published tests with:
+
+```bash
+python3 -m pip install -e '.[dev]'
+python3 -m unittest discover -s tests -v
 ```

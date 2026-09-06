@@ -20,9 +20,12 @@ def load_ephemeral_keys(capture_dir: Path):
     return server_e, client_e
 
 
-def load_simulated_recovery(capture_dir: Path) -> dict:
+def load_simulated_recovery(
+    capture_dir: Path,
+    relative_path: str = "keys/simulated_quantum_output.json",
+) -> dict:
     """Load the sole asymmetric-recovery artifact consumed by derivation."""
-    recovery = read_json(capture_dir / "keys/simulated_quantum_output.json")
+    recovery = read_json(capture_dir / relative_path)
     required = ("role", "group", "ephemeral_private", "ephemeral_public_check")
     missing = [name for name in required if not recovery.get(name)]
     if missing:

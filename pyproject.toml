@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hndl-research"
+version = "0.2.0"
+description = "Capture-to-recovery testbed for Harvest Now, Decrypt Later research"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = ["cryptography>=41"]
+
+[project.optional-dependencies]
+analysis = ["matplotlib>=3.7", "numpy>=1.24"]
+dev = ["black==25.1.0", "pytest>=8"]
+
+[project.scripts]
+hndl = "hndl:main"
+
+[tool.setuptools]
+py-modules = ["hndl", "experiment"]
+
+[tool.setuptools.packages.find]
+include = ["capture*", "decryptor*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+extend-exclude = "^(openssl|openssh)/"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

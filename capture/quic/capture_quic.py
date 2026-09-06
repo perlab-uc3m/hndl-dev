@@ -9,22 +9,25 @@ import threading
 import time
 from pathlib import Path
 
+from experiment import ArtifactLayout, ConfigurationError, recovery_spec
+
 from ..common import (
     reader_thread,
     persist_recovery_material,
     write_run_manifest,
     terminate,
     generate_cert_key,
-    start_tshark,
-    stop_tshark,
+    start_capture,
+    stop_capture,
+    start_process,
 )
 
 
-def _start_tshark_udp(
+def _start_udp_capture(
     pcap_file: Path, iface: str, port: int, logs_dir: Path, verbose: bool = False
 ):
     """Start the shared direct-dumpcap capture path with a UDP filter."""
-    return start_tshark(pcap_file, iface, port, logs_dir, verbose, transport="udp")
+    return start_capture(pcap_file, iface, port, logs_dir, verbose, transport="udp")
 
 
 def capture_quic(
@@ -42,16 +45,18 @@ def capture_quic(
     # Locate quic_server binary relative to the openssl binary
     quic_server_bin = openssl.parent / "quic_server"
     if not quic_server_bin.exists():
-        sys.exit(
+        raise ConfigurationError(
             f"quic_server not found at {quic_server_bin}.\n"
             "Build it with: bash scripts/build_quic_server.sh"
         )
 
-    pcap_dir = capture_root / "pcap"
-    logs_dir = capture_root / "logs"
-    keys_dir = capture_root / "keys"
-    for d in (pcap_dir, logs_dir, keys_dir):
-        d.mkdir(parents=True, exist_ok=True)
+    layout = ArtifactLayout(capture_root)
+    layout.create_capture_dirs()
+    pcap_dir, logs_dir, keys_dir = (
+        layout.archive_dir,
+        layout.logs_dir,
+        layout.keys_dir,
+    )
 
     keylog_file = keys_dir / "sslkeylog.log"
     cert_pem = keys_dir / "cert.pem"
@@ -74,8 +79,8 @@ def capture_quic(
     # Ensure QUIC server & client export ephemeral keys
     base_env["DEMO_PRINT_EPHEMERAL"] = "1"
 
-    # Start tshark (UDP capture)
-    tshark, tshark_threads = _start_tshark_udp(
+    # Start UDP packet capture.
+    capture, capture_threads = _start_udp_capture(
         pcap_file, iface, port, logs_dir, verbose
     )
 
@@ -98,8 +103,9 @@ def capture_quic(
     ]
     if verbose:
         print(f"[+] Starting QUIC server: {' '.join(server_cmd)}")
-    server = subprocess.Popen(
+    server = start_process(
         server_cmd,
+        "QUIC server",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.PIPE,
@@ -138,14 +144,14 @@ def capture_quic(
         print("[+] Waiting for QUIC server to be ready...")
     for _ in range(30):
         if server.poll() is not None:
-            stop_tshark(tshark, tshark_threads)
+            stop_capture(capture, capture_threads)
             raise RuntimeError("QUIC server exited before becoming ready")
         if server_accept_event.is_set():
             break
         time.sleep(0.1)
     if not server_accept_event.is_set():
         terminate(server, "quic_server")
-        stop_tshark(tshark, tshark_threads)
+        stop_capture(capture, capture_threads)
         raise RuntimeError("QUIC server did not report readiness")
     # Extra wait for UDP socket to be ready
     time.sleep(0.3)
@@ -168,8 +174,9 @@ def capture_quic(
     ]
     if verbose:
         print(f"[+] Starting QUIC client: {' '.join(client_cmd)}")
-    client = subprocess.Popen(
+    client = start_process(
         client_cmd,
+        "QUIC client",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.PIPE,
@@ -198,7 +205,7 @@ def capture_quic(
         client.stdin.write(http_req)
         client.stdin.flush()
         client.stdin.close()
-    except Exception:
+    except (BrokenPipeError, OSError, ValueError):
         pass
 
     # Wait for client to exit
@@ -214,7 +221,7 @@ def capture_quic(
         terminate(server, "quic_server")
         t_srv_out.join(timeout=1)
         t_srv_err.join(timeout=1)
-        stop_tshark(tshark, tshark_threads)
+        stop_capture(capture, capture_threads)
         raise RuntimeError(f"QUIC client failed with exit status {client.poll()}")
 
     # Wait for server to exit (one-shot mode)
@@ -223,8 +230,8 @@ def capture_quic(
     t_srv_out.join(timeout=1)
     t_srv_err.join(timeout=1)
 
-    # Stop tshark
-    stop_tshark(tshark, tshark_threads)
+    # Finalize the packet capture.
+    stop_capture(capture, capture_threads)
 
     response = client_stdout.read_bytes() if client_stdout.exists() else b""
     if b"A" * min(32, response_size) not in response:
@@ -275,6 +282,7 @@ def capture_quic(
         artifact_paths=[
             pcap_file,
             keylog_file,
+            client_keylog,
             recovery_file,
             ephemeral_truth_file,
             cert_pem,
@@ -294,6 +302,7 @@ def capture_quic(
             "keys/key.pem",
             "process logs",
         ],
+        recovery=recovery_spec("quic", None, port),
     )
 
     # Report
@@ -311,7 +320,7 @@ def capture_quic(
         size = pcap_file.stat().st_size
         if size == 0:
             print("[!] Warning: PCAP file is empty.")
-    except Exception:
+    except OSError:
         pass
 
     return {

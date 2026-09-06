@@ -1,168 +1,158 @@
 #!/usr/bin/env python3
-"""Unified capture entrypoint for TLS 1.2, TLS 1.3, QUIC, and SSH."""
+"""Typed capture dispatch for TLS 1.2, TLS 1.3, QUIC, and SSH."""
+
+from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
+from typing import Sequence
 
-from .common import ensure_exec, check_tool, now_ts
+from experiment import CaptureResult, ExperimentConfig, Protocol
 
-# TLS 1.3 implementations
-from .tls13.capture_1rtt import capture_1rtt as tls13_capture_1rtt
-from .tls13.capture_0rtt import capture_0rtt as tls13_capture_0rtt
-
-# TLS 1.2 implementations
-from .tls12.capture_rsa import capture_tls12_rsa
-
-# SSH implementation
-from .ssh.capture_ssh import capture_ssh
-
-# QUIC implementation
+from .common import CaptureLifecycle, check_tool, ensure_exec, now_ts
 from .quic.capture_quic import capture_quic
+from .ssh.capture_ssh import capture_ssh
+from .tls12.capture_rsa import capture_tls12_rsa
+from .tls13.capture_0rtt import capture_0rtt as tls13_capture_0rtt
+from .tls13.capture_1rtt import capture_1rtt as tls13_capture_1rtt
 
 
-def main():
-    repo_root = Path(__file__).resolve().parent.parent
+def _capture_configured(config: ExperimentConfig, capture_root: Path) -> None:
+    if config.protocol is Protocol.SSH:
+        sshd = config.openssh_dir / "sbin/sshd"
+        ssh = config.openssh_dir / "bin/ssh"
+        ssh_keygen = config.openssh_dir / "bin/ssh-keygen"
+        for binary, name in ((sshd, "sshd"), (ssh, "ssh"), (ssh_keygen, "ssh-keygen")):
+            ensure_exec(binary, name)
+        capture_ssh(
+            sshd,
+            ssh,
+            ssh_keygen,
+            config.interface,
+            config.port,
+            capture_root,
+            config.verbose,
+            config.ssh_rekey_limit,
+            config.ssh_payload_bytes,
+        )
+    else:
+        ensure_exec(config.openssl, "openssl")
+        if config.protocol is Protocol.TLS13:
+            capture_function = (
+                tls13_capture_0rtt
+                if config.mode.value == "0rtt"
+                else tls13_capture_1rtt
+            )
+            capture_function(
+                config.openssl,
+                config.interface,
+                config.port,
+                config.group,
+                capture_root,
+                config.verbose,
+            )
+        elif config.protocol is Protocol.QUIC:
+            capture_quic(
+                config.openssl,
+                config.interface,
+                config.port,
+                config.group,
+                capture_root,
+                config.verbose,
+            )
+        else:
+            capture_tls12_rsa(
+                config.openssl,
+                config.interface,
+                config.port,
+                capture_root,
+                config.verbose,
+            )
 
-    ap = argparse.ArgumentParser(
-        description="Unified TLS/SSH/QUIC capture tool",
-    )
 
-    ap.add_argument(
+def capture_protocol(config: ExperimentConfig) -> CaptureResult:
+    """Run one configured capture and return its exact artifacts."""
+    check_tool("tshark")
+    check_tool("dumpcap")
+    capture_root = config.data_root / f"{now_ts()}-{config.capture_label}"
+    with CaptureLifecycle():
+        _capture_configured(config, capture_root)
+
+    result = CaptureResult.from_manifest(capture_root)
+    if config.verbose:
+        print(f"\n[+] Capture result: {result}")
+    return result
+
+
+def _parser(repo_root: Path) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
         "--version",
-        choices=["tls12", "tls13", "ssh", "quic"],
-        default="tls13",
-        help="Protocol version to capture (default: tls13)",
+        choices=[protocol.value for protocol in Protocol],
+        default=Protocol.TLS13.value,
+        help="protocol to capture (default: tls13)",
     )
-    ap.add_argument(
-        "--mode",
-        help="Capture mode. tls13: {1rtt,0rtt}. tls12: {rsa}. ssh: ignored.",
-        default=None,
-    )
-    ap.add_argument(
+    parser.add_argument("--mode", help="tls13: 1rtt|0rtt; tls12: rsa")
+    parser.add_argument(
         "--openssl",
         default=str(repo_root / "openssl/.local/bin/openssl"),
-        help="Path to OpenSSL binary (default: ./openssl/.local/bin/openssl)",
+        help="OpenSSL binary (default: ./openssl/.local/bin/openssl)",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--openssh-dir",
         default=str(repo_root / "openssh/.local"),
-        help="Path to OpenSSH install directory (default: ./openssh/.local)",
+        help="OpenSSH installation (default: ./openssh/.local)",
     )
-    ap.add_argument("--iface", default="lo", help="Capture interface (default: lo)")
-    ap.add_argument("--port", type=int, default=44443, help="TCP port (default: 44443)")
-    ap.add_argument(
-        "--group",
-        default="X25519",
-        help="TLS group for TLS 1.3 -groups option (default: X25519)",
-    )
-    ap.add_argument(
+    parser.add_argument("--iface", default="lo", help="capture interface")
+    parser.add_argument("--port", type=int, help="loopback service port")
+    parser.add_argument("--group", default="X25519", help="TLS key-exchange group")
+    parser.add_argument(
         "--data-root",
         default=str(repo_root / "data"),
-        help="Root data directory (default: ./data)",
+        help="root data directory (default: ./data)",
     )
-    ap.add_argument(
-        "--label",
-        default=None,
-        help="Custom folder label suffix (default: auto-generated)",
-    )
-    ap.add_argument(
-        "--ssh-rekey-limit",
-        default=None,
-        help="OpenSSH RekeyLimit for an SSH experiment (for example 64K)",
-    )
-    ap.add_argument(
+    parser.add_argument("--label", help="custom capture-directory suffix")
+    parser.add_argument("--ssh-rekey-limit", help="OpenSSH RekeyLimit, e.g. 64K")
+    parser.add_argument(
         "--ssh-payload-bytes",
         type=int,
         default=0,
-        help="Zero bytes to send before the SSH recovery marker",
+        help="zero bytes to send before the SSH recovery marker",
     )
-    ap.add_argument("--verbose", action="store_true", help="Print detailed progress")
+    parser.add_argument("--verbose", action="store_true")
+    return parser
 
-    args = ap.parse_args()
 
-    if args.version in ("tls13", "quic") and args.group.lower() != "x25519":
-        ap.error("the recovery implementation currently supports --group X25519 only")
-
-    check_tool("tshark")
-    check_tool("dumpcap")
-
-    # Prepare capture directory label
-    if args.label is None:
-        if args.version == "ssh":
-            label = "ssh-capture"
-        elif args.version == "quic":
-            label = "quic-capture"
-        elif args.version == "tls13":
-            args.mode = args.mode or "1rtt"
-            label = f"tls13-{args.mode}-capture"
-        else:
-            args.mode = args.mode or "rsa"
-            label = f"tls12-{args.mode}-capture"
-    else:
-        label = args.label
-
-    capture_root = Path(args.data_root) / f"{now_ts()}-{label}"
-
-    # Dispatch
-    result = None
-    if args.version == "ssh":
-        openssh_dir = Path(args.openssh_dir)
-        sshd = openssh_dir / "sbin/sshd"
-        ssh_bin = openssh_dir / "bin/ssh"
-        ssh_keygen = openssh_dir / "bin/ssh-keygen"
-        for bin_path, name in [
-            (sshd, "sshd"),
-            (ssh_bin, "ssh"),
-            (ssh_keygen, "ssh-keygen"),
-        ]:
-            ensure_exec(bin_path, name)
-        result = capture_ssh(
-            sshd,
-            ssh_bin,
-            ssh_keygen,
-            args.iface,
+def main(argv: Sequence[str] | None = None) -> int:
+    repo_root = Path(__file__).resolve().parent.parent
+    parser = _parser(repo_root)
+    args = parser.parse_args(argv)
+    try:
+        config = ExperimentConfig.create(
+            args.version,
+            args.mode,
             args.port,
-            capture_root,
-            args.verbose,
-            args.ssh_rekey_limit,
-            args.ssh_payload_bytes,
+            interface=args.iface,
+            group=args.group,
+            data_root=args.data_root,
+            label=args.label,
+            openssl=args.openssl,
+            openssh_dir=args.openssh_dir,
+            verbose=args.verbose,
+            ssh_rekey_limit=args.ssh_rekey_limit,
+            ssh_payload_bytes=args.ssh_payload_bytes,
         )
-    elif args.version == "tls13":
-        openssl = Path(args.openssl)
-        ensure_exec(openssl, "openssl")
-        if args.mode not in ("1rtt", "0rtt"):
-            sys.exit("For tls13, --mode must be one of: 1rtt, 0rtt")
-        if args.mode == "1rtt":
-            result = tls13_capture_1rtt(
-                openssl, args.iface, args.port, args.group, capture_root, args.verbose
-            )
-        else:
-            result = tls13_capture_0rtt(
-                openssl, args.iface, args.port, args.group, capture_root, args.verbose
-            )
-    elif args.version == "quic":
-        openssl = Path(args.openssl)
-        ensure_exec(openssl, "openssl")
-        result = capture_quic(
-            openssl, args.iface, args.port, args.group, capture_root, args.verbose
-        )
-    else:  # tls12
-        openssl = Path(args.openssl)
-        ensure_exec(openssl, "openssl")
-        if args.mode != "rsa":
-            sys.exit("For tls12, only --mode rsa is supported")
-        result = capture_tls12_rsa(
-            openssl, args.iface, args.port, capture_root, args.verbose
-        )
-
-    if args.verbose:
-        print(f"\n[+] Capture result: {result}")
+        capture_protocol(config)
+        return 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Capture failed: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except KeyboardInterrupt:
-        print("\nInterrupted.")
-        sys.exit(1)
+        print("\nInterrupted.", file=sys.stderr)
+        raise SystemExit(130)

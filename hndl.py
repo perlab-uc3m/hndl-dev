@@ -1,214 +1,141 @@
 #!/usr/bin/env python3
-"""HN-DL Attack: Capture traffic, derive session keys."""
+"""Capture traffic and reproduce HN-DL session-key recovery."""
+
+from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
-import os
 from pathlib import Path
+from typing import Sequence
+
+from capture.capture import capture_protocol
+from decryptor.derive import recover_protocol
+from experiment import CaptureResult, ExperimentConfig, Protocol, RecoveryResult
 
 
-def find_latest_capture(data_dir: Path, protocol: str, mode: str = None) -> Path:
-    """Find the most recent capture directory."""
-    if protocol == "ssh":
-        pattern = "*-ssh-capture"
-    elif protocol == "tls13":
-        pattern = f"*-tls13-{mode}-capture" if mode else "*-tls13-*-capture"
-    elif protocol == "tls12":
-        pattern = f"*-tls12-{mode}-capture" if mode else "*-tls12-*-capture"
-    elif protocol == "quic":
-        pattern = "*-quic-capture"
-    else:
-        pattern = f"*-{protocol}-capture"
-
-    captures = sorted(data_dir.glob(pattern), reverse=True)
-    return captures[0] if captures else None
+REPO_ROOT = Path(__file__).resolve().parent
 
 
-def run_capture(
-    protocol: str,
-    mode: str,
-    port: int,
-    verbose: bool,
-    data_root: Path,
-    ssh_rekey_limit: str | None = None,
-    ssh_payload_bytes: int = 0,
-) -> Path:
-    """Run capture phase."""
-    print(f"\n[HARVEST] Capturing {protocol.upper()} traffic...")
-
-    cmd = [sys.executable, "-m", "capture.capture", "--version", protocol]
-    if mode:
-        cmd.extend(["--mode", mode])
-    if port:
-        cmd.extend(["--port", str(port)])
-    cmd.extend(["--data-root", str(data_root)])
-    if verbose:
-        cmd.append("--verbose")
-    if protocol == "ssh" and ssh_rekey_limit:
-        cmd.extend(["--ssh-rekey-limit", ssh_rekey_limit])
-    if protocol == "ssh" and ssh_payload_bytes:
-        cmd.extend(["--ssh-payload-bytes", str(ssh_payload_bytes)])
-
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        sys.exit(1)
-
-    capture_dir = find_latest_capture(data_root, protocol, mode)
-    if not capture_dir:
-        print("Error: Could not find capture directory")
-        sys.exit(1)
-
-    return capture_dir
+def run_capture(config: ExperimentConfig) -> CaptureResult:
+    """Capture exactly one configured experiment in this process."""
+    print(f"\n[HARVEST] Capturing {config.protocol.value.upper()} traffic...")
+    return capture_protocol(config)
 
 
 def run_decryption(
-    capture_dir: Path, protocol: str, mode: str, port: int, debug: bool
-) -> bool:
-    """Run key derivation phase."""
-    print(f"\n[DECRYPT] Deriving session keys...")
-
-    cmd = [
-        sys.executable,
-        "-W",
-        "ignore::RuntimeWarning",
-        "-m",
-        "decryptor.derive",
-        "--capture-dir",
-        str(capture_dir),
-        "--protocol",
-        protocol,
-        "--port",
-        str(port),
-    ]
-
-    if mode:
-        cmd.extend(["--mode", mode])
-    if debug:
-        cmd.append("--debug")
-
-    result = subprocess.run(cmd)
-    return result.returncode == 0
+    capture_dir: Path,
+    protocol: str | None = None,
+    mode: str | None = None,
+    port: int | None = None,
+    debug: bool = False,
+) -> RecoveryResult:
+    """Recover one capture, taking omitted parameters from its manifest."""
+    print("\n[DECRYPT] Deriving session keys...")
+    return recover_protocol(capture_dir, protocol, mode, debug, port)
 
 
-def get_keylog_path(capture_dir: Path, protocol: str, mode: str) -> Path:
-    """Get the expected keylog path for the given protocol/mode."""
-    if protocol == "ssh":
-        return capture_dir / "derived/ssh_derived_keys.json"
-    elif protocol == "tls13" and mode == "0rtt":
-        return capture_dir / "derived/nss_0rtt.keylog"
-    else:
-        return capture_dir / "derived/nss_derived.keylog"
+def _print_summary(capture: CaptureResult, recovery: RecoveryResult) -> None:
+    print(f"\n{'=' * 60}")
+    print(f"HN-DL Pipeline: {'SUCCESS' if recovery.success else 'FAILED'}")
+    print("=" * 60)
+    print(f"Capture: {capture.root}")
+    if recovery.success:
+        for artifact in recovery.derived_artifacts:
+            if artifact.is_file() and artifact.stat().st_size:
+                print(f"Derived: {artifact}")
+        for archive in capture.archives:
+            if archive.is_file() and archive.stat().st_size:
+                print(f"Archive: {archive}")
+    elif recovery.error:
+        print(f"Error:   {recovery.error}")
 
 
-def get_pcap_paths(capture_dir: Path, protocol: str, mode: str) -> list[Path]:
-    """Return the capture files produced by a protocol/mode."""
-    if protocol == "tls13" and mode == "0rtt":
-        return [
-            capture_dir / "pcap/tls13_0rtt_phase1_initial.pcapng",
-            capture_dir / "pcap/tls13_0rtt_phase2_resumption.pcapng",
-        ]
-    names = {
-        ("tls13", "1rtt"): "tls13_1rtt.pcapng",
-        ("tls12", "rsa"): "tls12_rsa.pcapng",
-        ("quic", None): "quic.pcapng",
-        ("ssh", None): "ssh_session.pcapng",
-    }
-    name = names.get((protocol, mode)) or names.get((protocol, None))
-    return [capture_dir / "pcap" / name] if name else []
-
-
-def main():
-    parser = argparse.ArgumentParser(description="HN-DL Attack Simulation")
+def _legacy_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--protocol", "-p", choices=["ssh", "tls13", "tls12", "quic"], default="tls13"
+        "--protocol", "-p", choices=[protocol.value for protocol in Protocol]
     )
-    parser.add_argument("--mode", "-m", help="tls13: 1rtt|0rtt, tls12: rsa")
+    parser.add_argument("--mode", "-m", help="tls13: 1rtt|0rtt; tls12: rsa")
     parser.add_argument("--port", type=int)
     parser.add_argument(
         "--data-root",
-        default="data",
-        help="Capture output directory (default: ./data)",
+        default=str(REPO_ROOT / "data"),
+        help="capture output directory (default: ./data)",
     )
+    parser.add_argument("--iface", default="lo", help="capture interface")
+    parser.add_argument("--group", default="X25519")
+    parser.add_argument(
+        "--openssl", default=str(REPO_ROOT / "openssl/.local/bin/openssl")
+    )
+    parser.add_argument("--openssh-dir", default=str(REPO_ROOT / "openssh/.local"))
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--debug", "-d", action="store_true")
     parser.add_argument("--capture-only", action="store_true")
     parser.add_argument("--decrypt-only", metavar="DIR")
     parser.add_argument("--ssh-rekey-limit", help="SSH RekeyLimit, e.g. 64K")
     parser.add_argument("--ssh-payload-bytes", type=int, default=0)
-    args = parser.parse_args()
+    return parser
 
-    # Defaults
-    if args.protocol == "ssh" and args.port is None:
-        args.port = 22222
-    elif args.port is None:
-        args.port = 44443
-    if args.protocol == "tls13" and args.mode is None:
-        args.mode = "1rtt"
-    if args.protocol == "tls12" and args.mode is None:
-        args.mode = "rsa"
-    # QUIC has no mode (always 1-RTT TLS 1.3 internally)
 
-    data_root = Path(args.data_root).resolve()
-    decrypt_only = Path(args.decrypt_only).resolve() if args.decrypt_only else None
-    os.chdir(Path(__file__).parent)
-
-    # Decrypt-only mode
-    if decrypt_only:
-        capture_dir = decrypt_only
-        if not capture_dir.exists():
-            sys.exit(f"Error: {capture_dir} not found")
-        success = run_decryption(
-            capture_dir, args.protocol, args.mode, args.port, args.debug
-        )
-        sys.exit(0 if success else 1)
-
-    # Capture
-    capture_dir = run_capture(
-        args.protocol,
-        args.mode,
-        args.port,
-        args.verbose,
-        data_root,
-        args.ssh_rekey_limit,
-        args.ssh_payload_bytes,
+def _recover_command(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="hndl recover", description="Recover a capture"
     )
+    parser.add_argument("capture_dir", type=Path)
+    parser.add_argument("--debug", "-d", action="store_true")
+    args = parser.parse_args(argv)
+    recovery = run_decryption(args.capture_dir.resolve(), debug=args.debug)
+    if recovery.success:
+        print(f"Recovery: SUCCESS ({recovery.capture_root})")
+        return 0
+    print(f"Recovery: FAILED ({recovery.error})", file=sys.stderr)
+    return 1
 
-    if args.capture_only:
-        print(f"\nCapture saved: {capture_dir}")
-        print(
-            f"To decrypt: python3 hndl.py -p {args.protocol} --decrypt-only {capture_dir}"
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(argv if argv is not None else sys.argv[1:])
+    if arguments[:1] == ["recover"]:
+        return _recover_command(arguments[1:])
+
+    args = _legacy_parser().parse_args(arguments)
+    if args.decrypt_only:
+        recovery = run_decryption(
+            Path(args.decrypt_only).resolve(),
+            args.protocol,
+            args.mode,
+            args.port,
+            args.debug,
         )
-        sys.exit(0)
+        if not recovery.success and recovery.error:
+            print(f"Recovery failed: {recovery.error}", file=sys.stderr)
+        return 0 if recovery.success else 1
 
-    # Decrypt
-    success = run_decryption(
-        capture_dir, args.protocol, args.mode, args.port, args.debug
-    )
-
-    # Summary
-    print(f"\n{'=' * 60}")
-    print(f"HN-DL Pipeline: {'SUCCESS' if success else 'FAILED'}")
-    print(f"{'=' * 60}")
-    print(f"Capture: {capture_dir}")
-    if success:
-        keylog = get_keylog_path(capture_dir, args.protocol, args.mode)
-        print(f"Keylog:  {keylog}")
-        pcaps = [
-            p
-            for p in get_pcap_paths(capture_dir, args.protocol, args.mode)
-            if p.exists() and p.stat().st_size
-        ]
-        if pcaps:
-            for pcap in pcaps:
-                print(f"PCAP:    {pcap}")
-        elif args.protocol == "ssh":
-            print(f"Archive: {capture_dir}/pcap/ssh_*_to_*.bin")
-        else:
-            print(f"PCAP:    {capture_dir}/pcap/")
-
-    sys.exit(0 if success else 1)
+    try:
+        config = ExperimentConfig.create(
+            args.protocol or Protocol.TLS13,
+            args.mode,
+            args.port,
+            interface=args.iface,
+            group=args.group,
+            data_root=args.data_root,
+            openssl=args.openssl,
+            openssh_dir=args.openssh_dir,
+            verbose=args.verbose,
+            ssh_rekey_limit=args.ssh_rekey_limit,
+            ssh_payload_bytes=args.ssh_payload_bytes,
+        )
+        capture = run_capture(config)
+        if args.capture_only:
+            print(f"\nCapture saved: {capture.root}")
+            print(f"To recover: python3 hndl.py recover {capture.root}")
+            return 0
+        recovery = run_decryption(capture.root, debug=args.debug)
+        _print_summary(capture, recovery)
+        return 0 if recovery.success else 1
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"HN-DL failed: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

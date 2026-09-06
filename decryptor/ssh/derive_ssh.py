@@ -2,12 +2,12 @@
 """Recover a selected SSH session from passive wire data plus oracle output."""
 
 import json
-import hashlib
-import multiprocessing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
+
+from experiment import sha256_file
 
 from ..core.ssh_crypto import (
     channel_data,
@@ -25,6 +25,7 @@ from ..io.pcap_parser import (
     get_tcp_stream_bytes,
     list_tcp_stream_indices,
 )
+from .oracle import SimulatedQuantumOracle
 
 
 EXPECTED_KEX = "curve25519-sha256"
@@ -39,139 +40,6 @@ GROUND_TRUTH_KEY_MAP = {
 }
 
 
-def _oracle_server(path: str, connection):
-    """Serve private values only in response to a matching recovered public value."""
-    try:
-        with Path(path).open() as handle:
-            data = json.load(handle)
-        recoveries = data.get("recoveries") or [
-            {
-                "ephemeral_private": data["ephemeral_private"],
-                "ephemeral_public": data["ephemeral_public_check"],
-            }
-        ]
-        connection.send(
-            {
-                "ok": True,
-                "metadata": {
-                    "algorithm": data.get("algorithm"),
-                    "recovered_side": data.get("recovered_side"),
-                },
-            }
-        )
-        used = set()
-        while True:
-            request = connection.recv()
-            if request is None:
-                break
-            public_value = request.get("ephemeral_public", "").lower()
-            match = next(
-                (
-                    (index, item)
-                    for index, item in enumerate(recoveries)
-                    if index not in used
-                    and item.get("ephemeral_public", "").lower() == public_value
-                ),
-                None,
-            )
-            if match is None:
-                connection.send(
-                    {
-                        "ok": False,
-                        "error": "no unreleased scalar matches this public value",
-                    }
-                )
-                continue
-            index, item = match
-            used.add(index)
-            connection.send(
-                {"ok": True, "ephemeral_private": item["ephemeral_private"]}
-            )
-    except (EOFError, KeyError, OSError, TypeError, ValueError) as exc:
-        try:
-            connection.send({"ok": False, "error": str(exc)})
-        except (BrokenPipeError, EOFError, OSError):
-            pass
-    finally:
-        connection.close()
-
-
-class SimulatedQuantumOracle:
-    """Process-isolated query interface for simulated future ECDLP outputs."""
-
-    def __init__(self, path: Path):
-        if not path.exists():
-            raise FileNotFoundError(f"Required input not found: {path}")
-        # Use fork explicitly on POSIX. Python 3.14's forkserver default opens
-        # a local control socket, which is unnecessary for this one-worker
-        # evidence boundary and fails in network-restricted runners.
-        context = multiprocessing.get_context("fork")
-        parent, child = context.Pipe()
-        self._connection = parent
-        self._process = context.Process(
-            target=_oracle_server, args=(str(path), child), daemon=True
-        )
-        self._process.start()
-        child.close()
-        if not parent.poll(5):
-            self.close()
-            raise RuntimeError("simulated quantum oracle did not start")
-        response = parent.recv()
-        if not response.get("ok"):
-            self.close()
-            raise ValueError(response.get("error", "simulated quantum oracle failed"))
-        self.metadata = response["metadata"]
-        self.release_trace = []
-
-    def recover(
-        self,
-        public_value: bytes,
-        epoch: int,
-        authenticated_packets_before_release: int,
-    ) -> bytes:
-        event = {
-            "epoch": epoch,
-            "public_value": public_value.hex(),
-            "public_input_recovered_from": (
-                "plaintext initial key exchange"
-                if epoch == 0
-                else "authenticated preceding-epoch transport"
-            ),
-            "authenticated_packets_before_release": authenticated_packets_before_release,
-            "status": "requested",
-        }
-        self.release_trace.append(event)
-        self._connection.send({"ephemeral_public": public_value.hex()})
-        if not self._connection.poll(5):
-            event["status"] = "timeout"
-            raise RuntimeError("simulated quantum oracle did not respond")
-        response = self._connection.recv()
-        if not response.get("ok"):
-            event["status"] = "rejected"
-            raise ValueError(response.get("error", "simulated recovery failed"))
-        private_value = bytes.fromhex(response["ephemeral_private"])
-        if curve25519_public_from_private(private_value) != public_value:
-            event["status"] = "inconsistent"
-            raise ValueError("oracle scalar does not match the recovered public value")
-        event["status"] = "released"
-        return private_value
-
-    def close(self):
-        if getattr(self, "_connection", None) is not None:
-            try:
-                self._connection.send(None)
-            except (BrokenPipeError, EOFError, OSError):
-                pass
-            self._connection.close()
-            self._connection = None
-        if getattr(self, "_process", None) is not None:
-            self._process.join(timeout=1)
-            if self._process.is_alive():
-                self._process.terminate()
-                self._process.join(timeout=1)
-            self._process = None
-
-
 def _load_json(path: Path, required: bool = True) -> dict:
     if not path.exists():
         if required:
@@ -179,14 +47,6 @@ def _load_json(path: Path, required: bool = True) -> dict:
         return {}
     with path.open() as f:
         return json.load(f)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _record_derivation_manifest(
@@ -206,7 +66,7 @@ def _record_derivation_manifest(
         "outputs": {
             str(path.relative_to(capture_path)): {
                 "bytes": path.stat().st_size,
-                "sha256": _sha256(path),
+                "sha256": sha256_file(path),
             }
             for path in derived_files
         },
@@ -327,7 +187,12 @@ def _all_epoch_ground_truth_validation(ground_truth: dict, epochs: list[dict]) -
     }
 
 
-def derive_ssh(capture_dir: Path, debug: bool = False) -> dict:
+def derive_ssh(
+    capture_dir: Path,
+    debug: bool = False,
+    recovery_name: str = "keys/simulated_quantum_output.json",
+    ground_truth_name: str = "keys/ssh_ground_truth.json",
+) -> dict:
     """Run passive SSH capture-to-decryption under the simulated CRQC model."""
     capture_path = Path(capture_dir)
     keys_dir = capture_path / "keys"
@@ -337,7 +202,7 @@ def derive_ssh(capture_dir: Path, debug: bool = False) -> dict:
 
     try:
         _, _, kex, archive_source = _load_wire_data(capture_path)
-        oracle = SimulatedQuantumOracle(keys_dir / "simulated_quantum_output.json")
+        oracle = SimulatedQuantumOracle(capture_path / recovery_name)
 
         negotiated = kex["negotiated"]
         if negotiated["kex"] != EXPECTED_KEX:
@@ -498,7 +363,7 @@ def derive_ssh(capture_dir: Path, debug: bool = False) -> dict:
 
         # This file is intentionally opened only after archive-only recovery
         # and authentication have succeeded.
-        ground_truth = _load_json(keys_dir / "ssh_ground_truth.json", required=False)
+        ground_truth = _load_json(capture_path / ground_truth_name, required=False)
         validation = _ground_truth_validation(
             ground_truth, shared_secret_raw, shared_secret_K, initial_H, trace
         )

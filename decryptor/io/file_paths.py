@@ -3,20 +3,26 @@
 
 from pathlib import Path
 
+from experiment import ArtifactLayout
 
-class CapturePaths:
-    """Centralized path management for capture directory structure."""
 
-    def __init__(self, capture_dir: Path, pcap_name: str = "pcap/tls13_1rtt.pcapng"):
-        self.capture_dir = Path(capture_dir)
-        self.pcap = self.capture_dir / pcap_name
+class RecoveryArtifacts(ArtifactLayout):
+    """Derived-file paths layered on the protocol-neutral artifact layout."""
 
-        self.keys_dir = self.capture_dir / "keys"
+    def __init__(
+        self,
+        capture_dir: Path,
+        pcap_name: str = "pcap/tls13_1rtt.pcapng",
+        keylog_name: str = "keys/sslkeylog.log",
+    ):
+        super().__init__(capture_dir)
+        self.capture_dir = self.root
+        self.pcap = self.resolve(pcap_name)
+
         self.server_ephemeral = self.keys_dir / "server_ephemeral.json"
         self.client_ephemeral = self.keys_dir / "client_ephemeral.json"
-        self.openssl_keylog = self.keys_dir / "sslkeylog.log"
+        self.openssl_keylog = self.resolve(keylog_name)
 
-        self.derived_dir = self.capture_dir / "derived"
         self.client_hello_bin = self.derived_dir / "client_hello.bin"
         self.server_hello_bin = self.derived_dir / "server_hello.bin"
         self.th_hello_full_hex = self.derived_dir / "th_hello_full.hex"
@@ -42,3 +48,7 @@ class CapturePaths:
     def openssl_keylog_exists(self) -> bool:
         """Check if OpenSSL keylog exists."""
         return self.openssl_keylog.exists()
+
+
+# Backward-compatible import for third-party code using the old name.
+CapturePaths = RecoveryArtifacts

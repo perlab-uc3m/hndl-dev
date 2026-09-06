@@ -4,9 +4,9 @@
 import binascii
 import hashlib
 import json
-import shutil
-import sys
 from pathlib import Path
+
+from experiment import require_tool
 
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
@@ -20,11 +20,6 @@ from ..io import (
     run_tshark,
     verify_tls_http_request,
 )
-
-
-def _check_tool(name: str):
-    if shutil.which(name) is None:
-        sys.exit(f"Required tool '{name}' not found in PATH")
 
 
 def _tshark_field(pcap: Path, port: int, filter_expr: str, field: str) -> str:
@@ -163,9 +158,11 @@ def derive_rsa(
     pcap_name: str = "pcap/tls12_rsa.pcapng",
     port: int = 44443,
     debug: bool = False,
+    recovery_name: str = "keys/simulated_quantum_output.pem",
+    ground_truth_name: str = "keys/sslkeylog.log",
 ) -> dict:
     """Derive TLS 1.2 RSA session keys from capture (RFC 5246, RFC 7627)."""
-    _check_tool("tshark")
+    require_tool("tshark")
 
     capture_path = Path(capture_dir)
     pcap = capture_path / pcap_name
@@ -175,7 +172,7 @@ def derive_rsa(
     if not pcap.exists():
         return {"success": False, "error": f"PCAP not found: {pcap}"}
 
-    key_path = keys_dir / "simulated_quantum_output.pem"
+    key_path = capture_path / recovery_name
     if not key_path.exists():
         return {
             "success": False,
@@ -220,7 +217,7 @@ def derive_rsa(
     )
 
     # Verify against OpenSSL keylog
-    keylog_path = keys_dir / "sslkeylog.log"
+    keylog_path = capture_path / ground_truth_name
     openssl_secrets = _parse_openssl_keylog(keylog_path)
     client_random_hex = client_random.hex()
 

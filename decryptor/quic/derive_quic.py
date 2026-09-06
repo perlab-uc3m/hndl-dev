@@ -11,7 +11,6 @@ frame bytes.
 import binascii
 import hashlib
 import hmac
-import shutil
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -20,6 +19,8 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
+
+from experiment import require_tool
 
 from ..core import (
     derive_tls13_keys_with_trace,
@@ -30,7 +31,7 @@ from ..core import (
     compute_th_finished,
 )
 from ..io import (
-    CapturePaths,
+    RecoveryArtifacts,
     load_simulated_recovery,
     save_key_schedule_trace,
     parse_client_random_from_ch,
@@ -722,17 +723,18 @@ def derive_quic(
     curve: str = "x25519",
     hash_algo: str = "auto",
     debug: bool = False,
+    recovery_name: str = "keys/simulated_quantum_output.json",
+    ground_truth_name: str = "keys/sslkeylog.log",
 ) -> dict:
     """Derive QUIC session keys from capture (RFC 9001, TLS 1.3 key schedule)."""
-    if shutil.which("tshark") is None:
-        return {"success": False, "error": "tshark not found in PATH"}
+    require_tool("tshark")
 
-    paths = CapturePaths(capture_dir, pcap_name)
+    paths = RecoveryArtifacts(capture_dir, pcap_name, ground_truth_name)
     if not paths.pcap_exists():
         return {"success": False, "error": f"PCAP not found: {paths.pcap}"}
 
     try:
-        recovery = load_simulated_recovery(paths.capture_dir)
+        recovery = load_simulated_recovery(paths.capture_dir, recovery_name)
     except (OSError, ValueError) as exc:
         return {"success": False, "error": str(exc)}
     if recovery["group"].lower() != "x25519" or curve.lower() != "x25519":

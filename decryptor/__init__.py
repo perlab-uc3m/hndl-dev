@@ -13,4 +13,11 @@ def derive(*args, **kwargs):
     return _derive(*args, **kwargs)
 
 
-__all__ = ["derive"]
+def recover_protocol(*args, **kwargs):
+    """Lazily dispatch to the typed recovery API."""
+    from .derive import recover_protocol as _recover_protocol
+
+    return _recover_protocol(*args, **kwargs)
+
+
+__all__ = ["derive", "recover_protocol"]

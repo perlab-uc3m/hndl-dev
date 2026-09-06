@@ -3,9 +3,9 @@
 
 import binascii
 import hashlib
-import shutil
-import sys
 from pathlib import Path
+
+from experiment import require_tool
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
 
@@ -18,16 +18,10 @@ from ..core import (
     compute_th_finished,
 )
 from ..io import (
-    CapturePaths,
+    RecoveryArtifacts,
     load_simulated_recovery,
     save_key_schedule_trace,
-    find_first_frame,
-    hexdump_frame,
-    extract_first_handshake_message,
-    iter_tcp_payloads,
-    parse_first_handshake_from_payload,
-    list_tcp_stream_indices,
-    get_tcp_stream_bytes,
+    extract_tls_hello_pair,
     parse_client_random_from_ch,
     parse_cipher_from_server_hello,
     parse_client_keyshare_pub_from_ch,
@@ -37,62 +31,11 @@ from ..io import (
 )
 
 
-def _check_tool(name: str):
-    if shutil.which(name) is None:
-        sys.exit(f"Required tool '{name}' not found in PATH")
-
-
 def _x25519_pub_from_priv(hexstr: str) -> bytes:
     pk = x25519.X25519PrivateKey.from_private_bytes(binascii.unhexlify(hexstr))
     return pk.public_key().public_bytes(
         encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
     )
-
-
-def _extract_hello_messages(paths: CapturePaths, port: int, debug: bool):
-    """Extract ClientHello and ServerHello from PCAP."""
-    f_ch = find_first_frame(paths.pcap, "tls.handshake.type==1", port)
-    f_sh = find_first_frame(paths.pcap, "tls.handshake.type==2", port)
-
-    ch = sh = None
-    if f_ch and f_sh:
-        try:
-            fb_ch = hexdump_frame(paths.pcap, f_ch, port)
-            ch = extract_first_handshake_message(fb_ch, expected_type=1)
-            fb_sh = hexdump_frame(paths.pcap, f_sh, port)
-            sh = extract_first_handshake_message(fb_sh, expected_type=2)
-        except Exception:
-            ch = sh = None
-
-    # Fallback: scan TCP payloads
-    if ch is None or sh is None:
-        for _, payload in iter_tcp_payloads(paths.pcap, port):
-            if ch is None:
-                ch = parse_first_handshake_from_payload(payload, expected_type=1)
-            if sh is None:
-                sh = parse_first_handshake_from_payload(payload, expected_type=2)
-            if ch and sh:
-                break
-
-    # Fallback: stream reassembly
-    if ch is None or sh is None:
-        for stream_idx in list_tcp_stream_indices(paths.pcap, port):
-            try:
-                c2s, s2c = get_tcp_stream_bytes(paths.pcap, stream_idx)
-            except Exception:
-                continue
-            if ch is None:
-                ch = parse_first_handshake_from_payload(
-                    c2s, expected_type=1
-                ) or parse_first_handshake_from_payload(s2c, expected_type=1)
-            if sh is None:
-                sh = parse_first_handshake_from_payload(
-                    s2c, expected_type=2
-                ) or parse_first_handshake_from_payload(c2s, expected_type=2)
-            if ch and sh:
-                break
-
-    return ch, sh
 
 
 def _compute_th_finished(
@@ -127,23 +70,25 @@ def derive_1rtt(
     curve: str = "x25519",
     hash_algo: str = "auto",
     debug: bool = False,
+    recovery_name: str = "keys/simulated_quantum_output.json",
+    ground_truth_name: str = "keys/sslkeylog.log",
 ) -> dict:
     """Derive TLS 1.3 1-RTT session keys from capture (RFC 8446)."""
-    _check_tool("tshark")
+    require_tool("tshark")
 
-    paths = CapturePaths(capture_dir, pcap_name)
+    paths = RecoveryArtifacts(capture_dir, pcap_name, ground_truth_name)
     if not paths.pcap_exists():
         return {"success": False, "error": f"PCAP not found: {paths.pcap}"}
 
     try:
-        recovery = load_simulated_recovery(paths.capture_dir)
+        recovery = load_simulated_recovery(paths.capture_dir, recovery_name)
     except (OSError, ValueError) as exc:
         return {"success": False, "error": str(exc)}
     if recovery["group"].lower() != "x25519" or curve.lower() != "x25519":
         return {"success": False, "error": "Only X25519 recovery is supported"}
 
     # Extract CH/SH
-    ch, sh = _extract_hello_messages(paths, port, debug)
+    ch, sh = extract_tls_hello_pair(paths.pcap, port)
     if not ch or not sh:
         return {"success": False, "error": "Could not extract ClientHello/ServerHello"}
 

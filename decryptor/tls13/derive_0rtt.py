@@ -3,9 +3,9 @@
 
 import binascii
 import hashlib
-import shutil
-import sys
 from pathlib import Path
+
+from experiment import require_tool
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
 
@@ -20,11 +20,9 @@ from ..core import (
     derive_early_secrets,
 )
 from ..io import (
-    CapturePaths,
+    RecoveryArtifacts,
     load_simulated_recovery,
-    find_first_frame,
-    hexdump_frame,
-    extract_first_handshake_message,
+    extract_tls_hello_pair,
     parse_client_random_from_ch,
     parse_cipher_from_server_hello,
     parse_client_keyshare_pub_from_ch,
@@ -32,60 +30,7 @@ from ..io import (
     extract_decrypted_handshake_from_tshark,
     parse_new_session_ticket,
     verify_tls_http_request,
-    iter_tcp_payloads,
-    parse_first_handshake_from_payload,
-    list_tcp_stream_indices,
-    get_tcp_stream_bytes,
 )
-
-
-def _check_tool(name: str):
-    if shutil.which(name) is None:
-        sys.exit(f"Required tool '{name}' not found in PATH")
-
-
-def _extract_ch_sh(pcap: Path, port: int):
-    """Extract ClientHello and ServerHello from PCAP."""
-    f_ch = find_first_frame(pcap, "tls.handshake.type==1", port)
-    f_sh = find_first_frame(pcap, "tls.handshake.type==2", port)
-
-    ch = sh = None
-    if f_ch and f_sh:
-        try:
-            fb_ch = hexdump_frame(pcap, f_ch, port)
-            ch = extract_first_handshake_message(fb_ch, expected_type=1)
-            fb_sh = hexdump_frame(pcap, f_sh, port)
-            sh = extract_first_handshake_message(fb_sh, expected_type=2)
-        except (RuntimeError, ValueError):
-            ch = sh = None
-
-    if ch is None or sh is None:
-        for _, payload in iter_tcp_payloads(pcap, port):
-            if ch is None:
-                ch = parse_first_handshake_from_payload(payload, expected_type=1)
-            if sh is None:
-                sh = parse_first_handshake_from_payload(payload, expected_type=2)
-            if ch and sh:
-                break
-
-    if ch is None or sh is None:
-        for stream_index in list_tcp_stream_indices(pcap, port):
-            try:
-                side_a, side_b = get_tcp_stream_bytes(pcap, stream_index)
-            except RuntimeError:
-                continue
-            if ch is None:
-                ch = parse_first_handshake_from_payload(
-                    side_a, 1
-                ) or parse_first_handshake_from_payload(side_b, 1)
-            if sh is None:
-                sh = parse_first_handshake_from_payload(
-                    side_a, 2
-                ) or parse_first_handshake_from_payload(side_b, 2)
-            if ch and sh:
-                break
-
-    return ch, sh
 
 
 def _extract_psk_ticket_from_ch(ch: bytes) -> bytes:
@@ -136,9 +81,11 @@ def derive_0rtt(
     curve: str = "x25519",
     hash_algo: str = "auto",
     debug: bool = False,
+    recovery_name: str = "keys/simulated_quantum_output.json",
+    ground_truth_name: str = "keys/sslkeylog.log",
 ) -> dict:
     """Derive 0-RTT CLIENT_EARLY_TRAFFIC_SECRET from two-phase capture (RFC 8446)."""
-    _check_tool("tshark")
+    require_tool("tshark")
 
     capture_path = Path(capture_dir)
     pcap1 = capture_path / pcap_phase1
@@ -147,19 +94,19 @@ def derive_0rtt(
     if not pcap1.exists() or not pcap2.exists():
         return {"success": False, "error": f"Missing PCAPs: {pcap1} or {pcap2}"}
 
-    paths = CapturePaths(capture_path)
+    paths = RecoveryArtifacts(capture_path, keylog_name=ground_truth_name)
     paths.ensure_derived_dir()
 
     # ========== PHASE 1: Derive PSK from initial handshake ==========
 
     try:
-        recovery = load_simulated_recovery(capture_path)
+        recovery = load_simulated_recovery(capture_path, recovery_name)
     except (OSError, ValueError) as exc:
         return {"success": False, "error": str(exc)}
     if recovery["group"].lower() != "x25519" or curve.lower() != "x25519":
         return {"success": False, "error": "Only X25519 recovery is supported"}
 
-    ch1, sh1 = _extract_ch_sh(pcap1, port)
+    ch1, sh1 = extract_tls_hello_pair(pcap1, port)
     if not ch1 or not sh1:
         return {"success": False, "error": "Could not extract CH/SH from phase 1"}
 
@@ -298,7 +245,7 @@ def derive_0rtt(
 
     # ========== PHASE 2: Derive CLIENT_EARLY_TRAFFIC_SECRET ==========
 
-    ch2, _ = _extract_ch_sh(pcap2, port)
+    ch2, _ = extract_tls_hello_pair(pcap2, port)
     if not ch2:
         return {"success": False, "error": "Could not extract ClientHello from phase 2"}
 

@@ -38,6 +38,7 @@ from capture.common import (
     terminate,
 )
 from decryptor.io import run_tshark
+from analysis.common import pcap_total_bytes
 
 # ---------------------------------------------------------------------------
 # Plot style
@@ -96,35 +97,6 @@ ROTATION_PAYLOAD_EXP = [10_000, 50_000, 100_000, 500_000, 1_000_000]
 # ---------------------------------------------------------------------------
 # PCAP helpers
 # ---------------------------------------------------------------------------
-
-
-def pcap_total_bytes(pcap_path: Path, skip_pure_acks: bool = True) -> int:
-    """Sum frame lengths in a pcapng file, optionally excluding pure TCP ACKs."""
-    cmd = [
-        "tshark",
-        "-r",
-        str(pcap_path),
-        "-T",
-        "fields",
-        "-e",
-        "frame.len",
-        "-e",
-        "tcp.len",
-    ]
-    result = run_tshark(cmd, pcap_path)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr or "tshark failed while measuring PCAP")
-    total = 0
-    for line in result.stdout.splitlines():
-        parts = line.split("\t")
-        if not parts or not parts[0].strip().isdigit():
-            continue
-        frame_len = int(parts[0].strip())
-        tcp_len_str = parts[1].strip() if len(parts) > 1 else ""
-        if skip_pure_acks and tcp_len_str.isdigit() and int(tcp_len_str) == 0:
-            continue
-        total += frame_len
-    return total
 
 
 def count_client_hellos(pcap_path: Path, keylog_path: Path) -> int:

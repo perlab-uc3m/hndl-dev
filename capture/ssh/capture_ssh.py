@@ -2,41 +2,28 @@
 """SSH capture with separated simulated-quantum and ground-truth hooks."""
 
 import json
-import hashlib
 import os
-import platform
 import re
 import select
 import socket
 import subprocess
-import sys
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
-from ..common import terminate, start_tshark, stop_tshark
+from experiment import ArtifactLayout, recovery_spec
+
+from ..common import (
+    start_capture,
+    start_process,
+    stop_capture,
+    terminate,
+    version_output,
+    write_run_manifest,
+)
 
 SSH_QUANTUM_RE = re.compile(r"SSH_QUANTUM_(\w+)=\s*([0-9a-fA-F]+)")
 SSH_GROUND_TRUTH_RE = re.compile(r"SSH_GROUND_TRUTH_(\w+)=\s*([0-9a-fA-F]+)")
-
-
-def _sha256(path: Path) -> str:
-    """Return a stable content hash for one evidence or implementation file."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _version_output(command: list[str]) -> str:
-    """Collect a tool version without making capture success depend on it."""
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
-        return (result.stdout + result.stderr).strip()
-    except (OSError, subprocess.SubprocessError) as exc:
-        return f"unavailable: {exc}"
 
 
 def record_ssh_streams(
@@ -73,9 +60,10 @@ def record_ssh_streams(
         outputs = {downstream: client_to_server_file, upstream: server_to_client_file}
         active = {downstream, upstream}
 
-        with client_to_server_file.open("wb") as c2s, server_to_client_file.open(
-            "wb"
-        ) as s2c:
+        with (
+            client_to_server_file.open("wb") as c2s,
+            server_to_client_file.open("wb") as s2c,
+        ):
             handles = {
                 client_to_server_file: c2s,
                 server_to_client_file: s2c,
@@ -248,11 +236,13 @@ def capture_ssh(
     if payload_bytes < 0:
         raise ValueError("SSH payload size cannot be negative")
 
-    pcap_dir = capture_root / "pcap"
-    logs_dir = capture_root / "logs"
-    keys_dir = capture_root / "keys"
-    for d in (pcap_dir, logs_dir, keys_dir):
-        d.mkdir(parents=True, exist_ok=True)
+    layout = ArtifactLayout(capture_root)
+    layout.create_capture_dirs()
+    pcap_dir, logs_dir, keys_dir = (
+        layout.archive_dir,
+        layout.logs_dir,
+        layout.keys_dir,
+    )
 
     pcap_file = pcap_dir / "ssh_session.pcapng"
     client_stream_file = pcap_dir / "ssh_client_to_server.bin"
@@ -274,13 +264,15 @@ def capture_ssh(
     # Capture the public-side connection. The byte-recording relay is also an
     # exact transport-stream archive and permits deterministic testing when the
     # host has not granted dumpcap capture capabilities.
-    tshark = None
-    tshark_threads = None
-    tshark_error = None
+    capture = None
+    capture_threads = None
+    capture_error = None
     try:
-        tshark, tshark_threads = start_tshark(pcap_file, iface, port, logs_dir, verbose)
+        capture, capture_threads = start_capture(
+            pcap_file, iface, port, logs_dir, verbose
+        )
     except RuntimeError as exc:
-        tshark_error = str(exc)
+        capture_error = str(exc)
         print(f"[!] PCAP capture unavailable; retaining SSH wire streams: {exc}")
 
     # Start sshd (debug mode, no fork)
@@ -288,8 +280,12 @@ def capture_ssh(
     if verbose:
         print(f"[+] Starting sshd: {' '.join(sshd_cmd)}")
 
-    server = subprocess.Popen(
-        sshd_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid
+    server = start_process(
+        sshd_cmd,
+        "sshd",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        preexec_fn=os.setsid,
     )
     server_ready = threading.Event()
     t_srv = threading.Thread(
@@ -316,14 +312,14 @@ def capture_ssh(
         time.sleep(0.1)
     if server.poll() is not None:
         t_srv.join(timeout=1)
-        if tshark is not None:
-            stop_tshark(tshark, tshark_threads)
+        if capture is not None:
+            stop_capture(capture, capture_threads)
         detail = (logs_dir / "sshd_stderr.log").read_text(errors="replace")
         raise RuntimeError(f"sshd exited before becoming ready:\n{detail}")
     if not server_ready.is_set():
         terminate(server, "sshd")
-        if tshark is not None:
-            stop_tshark(tshark, tshark_threads)
+        if capture is not None:
+            stop_capture(capture, capture_threads)
         raise RuntimeError("sshd did not report readiness")
     time.sleep(0.3)
 
@@ -346,8 +342,8 @@ def capture_ssh(
     t_proxy.start()
     if not proxy_ready.wait(timeout=3) or proxy_errors:
         terminate(server, "sshd")
-        if tshark is not None:
-            stop_tshark(tshark, tshark_threads)
+        if capture is not None:
+            stop_capture(capture, capture_threads)
         raise RuntimeError(f"SSH recording relay failed: {proxy_errors}")
 
     # Start ssh client
@@ -392,8 +388,9 @@ def capture_ssh(
 
     application_output = logs_dir / "application_stdout.bin"
     application_handle = application_output.open("wb")
-    client = subprocess.Popen(
+    client = start_process(
         ssh_cmd,
+        "ssh",
         stdout=application_handle,
         stderr=subprocess.PIPE,
         preexec_fn=os.setsid,
@@ -441,8 +438,8 @@ def capture_ssh(
     if t_proxy.is_alive():
         proxy_stop.set()
         t_proxy.join(timeout=1)
-    if tshark is not None:
-        stop_tshark(tshark, tshark_threads)
+    if capture is not None:
+        stop_capture(capture, capture_threads)
     t_srv.join(timeout=1)
     t_cli.join(timeout=1)
     if proxy_errors:
@@ -480,6 +477,7 @@ def capture_ssh(
         Path(__file__).resolve(),
         repo_root / "capture" / "common.py",
         repo_root / "decryptor" / "ssh" / "derive_ssh.py",
+        repo_root / "decryptor" / "ssh" / "oracle.py",
         repo_root / "decryptor" / "core" / "ssh_crypto.py",
         repo_root / "decryptor" / "io" / "pcap_parser.py",
     ]
@@ -501,16 +499,9 @@ def capture_ssh(
         logs_dir / "tshark_stderr.log",
         application_output,
     ]
-    git_commit = _version_output(
-        ["git", "-C", str(repo_root), "rev-parse", "HEAD"]
-    ).splitlines()[0]
-    git_dirty = bool(
-        _version_output(["git", "-C", str(repo_root), "status", "--porcelain"])
-    )
-    manifest = {
-        "schema": "hndl-ssh-run-manifest-v1",
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "experiment": {
+    manifest_file = write_run_manifest(
+        capture_root,
+        experiment={
             "protocol": "SSH-2",
             "openssh_target": "9.9p2",
             "kex": "curve25519-sha256",
@@ -523,50 +514,30 @@ def capture_ssh(
             "rekey_limit": rekey_limit,
             "payload_bytes": payload_bytes,
             "pcap_available": pcap_file.exists() and pcap_file.stat().st_size > 0,
-            "pcap_error": tshark_error,
+            "pcap_error": capture_error,
         },
-        "commands": {"sshd": sshd_cmd, "ssh": ssh_cmd},
-        "software": {
-            "python": sys.version,
-            "platform": platform.platform(),
-            "uname": list(platform.uname()),
-            "ssh_version": _version_output([str(ssh), "-V"]),
-            "sshd_version": _version_output([str(sshd), "-V"]),
-            "tshark_version": _version_output(["tshark", "--version"]),
-            "repository_commit": git_commit,
-            "repository_dirty": git_dirty,
+        commands={"sshd": sshd_cmd, "ssh": ssh_cmd},
+        binaries=[ssh, sshd, ssh_keygen],
+        implementation_paths=implementation_paths,
+        artifact_paths=evidence_paths,
+        attack_inputs=[
+            "pcap/ssh_session.pcapng or both direction-separated wire streams",
+            "keys/simulated_quantum_output.json",
+        ],
+        excluded_from_attack_inputs=[
+            "keys/ssh_ground_truth.json",
+            "keys/ssh_host_ed25519_key and public key",
+            "keys/user_ed25519_key, public key, and authorized_keys",
+            "logs/application_stdout.bin",
+            "logs/ssh_stderr.log and logs/sshd_stderr.log",
+        ],
+        recovery=recovery_spec("ssh", None, port),
+        schema="hndl-ssh-run-manifest-v1",
+        software_extra={
+            "ssh_version": version_output([str(ssh), "-V"]),
+            "sshd_version": version_output([str(sshd), "-V"]),
         },
-        "binary_sha256": {str(path): _sha256(path) for path in (ssh, sshd, ssh_keygen)},
-        "implementation_sha256": {
-            str(path.relative_to(repo_root)): _sha256(path)
-            for path in implementation_paths
-            if path.exists()
-        },
-        "artifacts": {
-            str(path.relative_to(capture_root)): {
-                "bytes": path.stat().st_size,
-                "sha256": _sha256(path),
-            }
-            for path in evidence_paths
-            if path.exists()
-        },
-        "evidence_boundary": {
-            "attack_inputs": [
-                "pcap/ssh_session.pcapng or both direction-separated wire streams",
-                "keys/simulated_quantum_output.json",
-            ],
-            "excluded_from_attack_inputs": [
-                "keys/ssh_ground_truth.json",
-                "keys/ssh_host_ed25519_key and public key",
-                "keys/user_ed25519_key, public key, and authorized_keys",
-                "logs/application_stdout.bin",
-                "logs/ssh_stderr.log and logs/sshd_stderr.log",
-            ],
-        },
-    }
-    manifest_file = capture_root / "manifest.json"
-    with manifest_file.open("w") as f:
-        json.dump(manifest, f, indent=2)
+    )
 
     # Report
     print("SSH capture complete.")
@@ -587,7 +558,7 @@ def capture_ssh(
         "pcap": str(pcap_file),
         "client_to_server_stream": str(client_stream_file),
         "server_to_client_stream": str(server_stream_file),
-        "pcap_error": tshark_error,
+        "pcap_error": capture_error,
         "simulated_quantum_output": str(oracle_file),
         "ground_truth": str(truth_file),
         "manifest": str(manifest_file),

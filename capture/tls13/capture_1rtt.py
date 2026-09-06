@@ -8,14 +8,17 @@ import threading
 import time
 from pathlib import Path
 
+from experiment import ArtifactLayout, recovery_spec
+
 from ..common import (
     reader_thread,
     persist_recovery_material,
     write_run_manifest,
     terminate,
     generate_cert_key,
-    start_tshark,
-    stop_tshark,
+    start_capture,
+    stop_capture,
+    start_process,
 )
 
 
@@ -28,11 +31,13 @@ def capture_1rtt(
     verbose: bool = False,
 ):
     """Capture a TLS 1.3 1-RTT session (full ECDHE handshake)."""
-    pcap_dir = capture_root / "pcap"
-    logs_dir = capture_root / "logs"
-    keys_dir = capture_root / "keys"
-    for d in (pcap_dir, logs_dir, keys_dir):
-        d.mkdir(parents=True, exist_ok=True)
+    layout = ArtifactLayout(capture_root)
+    layout.create_capture_dirs()
+    pcap_dir, logs_dir, keys_dir = (
+        layout.archive_dir,
+        layout.logs_dir,
+        layout.keys_dir,
+    )
 
     keylog_file = keys_dir / "sslkeylog.log"
     cert_pem = keys_dir / "cert.pem"
@@ -52,8 +57,8 @@ def capture_1rtt(
     # Generate cert/key
     base_env = generate_cert_key(openssl, cert_pem, key_pem, keys_dir, verbose)
 
-    # Start tshark
-    tshark, tshark_threads = start_tshark(pcap_file, iface, port, logs_dir, verbose)
+    # Start packet capture.
+    capture, capture_threads = start_capture(pcap_file, iface, port, logs_dir, verbose)
 
     # Start server
     server_cmd = [
@@ -74,8 +79,9 @@ def capture_1rtt(
     ]
     if verbose:
         print(f"[+] Starting server: {' '.join(server_cmd)}")
-    server = subprocess.Popen(
+    server = start_process(
         server_cmd,
+        "TLS 1.3 server",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.PIPE,
@@ -108,14 +114,14 @@ def capture_1rtt(
         print("[+] Waiting for server to be ready...")
     for _ in range(50):
         if server.poll() is not None:
-            stop_tshark(tshark, tshark_threads)
+            stop_capture(capture, capture_threads)
             raise RuntimeError("TLS 1.3 server exited before becoming ready")
         if server_accept_event.is_set():
             break
         time.sleep(0.1)
     if not server_accept_event.is_set():
         terminate(server, "server")
-        stop_tshark(tshark, tshark_threads)
+        stop_capture(capture, capture_threads)
         raise RuntimeError("TLS 1.3 server did not report readiness")
 
     # Start client
@@ -135,8 +141,9 @@ def capture_1rtt(
     ]
     if verbose:
         print(f"[+] Starting client: {' '.join(client_cmd)}")
-    client = subprocess.Popen(
+    client = start_process(
         client_cmd,
+        "TLS 1.3 client",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.PIPE,
@@ -163,7 +170,7 @@ def capture_1rtt(
         client.stdin.write(http_req)
         client.stdin.flush()
         client.stdin.close()
-    except Exception:
+    except (BrokenPipeError, OSError, ValueError):
         pass
 
     # Wait for client exit
@@ -179,7 +186,7 @@ def capture_1rtt(
         terminate(server, "server")
         t_srv_out.join(timeout=1)
         t_srv_err.join(timeout=1)
-        stop_tshark(tshark, tshark_threads)
+        stop_capture(capture, capture_threads)
         raise RuntimeError(f"TLS 1.3 client failed with exit status {client.poll()}")
 
     # Stop server
@@ -188,8 +195,8 @@ def capture_1rtt(
     t_srv_out.join(timeout=1)
     t_srv_err.join(timeout=1)
 
-    # Stop tshark
-    stop_tshark(tshark, tshark_threads)
+    # Finalize the packet capture.
+    stop_capture(capture, capture_threads)
 
     response = client_stdout.read_bytes() if client_stdout.exists() else b""
     if b"HTTP/" not in response:
@@ -249,6 +256,7 @@ def capture_1rtt(
             "keys/key.pem",
             "process logs",
         ],
+        recovery=recovery_spec("tls13", "1rtt", port),
     )
 
     # Report
@@ -266,7 +274,7 @@ def capture_1rtt(
         size = pcap_file.stat().st_size
         if size == 0:
             print("[!] Warning: PCAP file is empty.")
-    except Exception:
+    except OSError:
         pass
 
     return {

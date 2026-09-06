@@ -8,14 +8,17 @@ import threading
 import time
 from pathlib import Path
 
+from experiment import ArtifactLayout, recovery_spec
+
 from ..common import (
     reader_thread,
     persist_recovery_material,
     write_run_manifest,
     terminate,
     generate_cert_key,
-    start_tshark,
-    stop_tshark,
+    start_capture,
+    stop_capture,
+    start_process,
 )
 
 
@@ -28,11 +31,13 @@ def capture_0rtt(
     verbose: bool = False,
 ):
     """Capture a TLS 1.3 0-RTT session (initial handshake + resumption with early data)."""
-    pcap_dir = capture_root / "pcap"
-    logs_dir = capture_root / "logs"
-    keys_dir = capture_root / "keys"
-    for d in (pcap_dir, logs_dir, keys_dir):
-        d.mkdir(parents=True, exist_ok=True)
+    layout = ArtifactLayout(capture_root)
+    layout.create_capture_dirs()
+    pcap_dir, logs_dir, keys_dir = (
+        layout.archive_dir,
+        layout.logs_dir,
+        layout.keys_dir,
+    )
 
     keylog_file = keys_dir / "sslkeylog.log"
     cert_pem = keys_dir / "cert.pem"
@@ -59,8 +64,8 @@ def capture_0rtt(
     if verbose:
         print("\n[PHASE 1] Initial handshake to obtain session ticket")
 
-    # Start tshark for phase 1
-    tshark1, tshark1_threads = start_tshark(
+    # Start packet capture for phase 1.
+    capture1, capture1_threads = start_capture(
         pcap_file_phase1, iface, port, logs_dir / "phase1", verbose
     )
 
@@ -94,8 +99,9 @@ def capture_0rtt(
 
     server1_stdout = logs_dir / "phase1_server_stdout.log"
     server1_stderr = logs_dir / "phase1_server_stderr.log"
-    server1 = subprocess.Popen(
+    server1 = start_process(
         server_cmd,
+        "TLS 1.3 0-RTT server",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.PIPE,
@@ -140,14 +146,14 @@ def capture_0rtt(
         print("[+] Waiting for server to be ready...")
     for _ in range(50):
         if server1.poll() is not None:
-            stop_tshark(tshark1, tshark1_threads)
+            stop_capture(capture1, capture1_threads)
             raise RuntimeError("server exited before phase 1 became ready")
         if server1_accept_event.is_set():
             break
         time.sleep(0.1)
     if not server1_accept_event.is_set():
         terminate(server1, "server")
-        stop_tshark(tshark1, tshark1_threads)
+        stop_capture(capture1, capture1_threads)
         raise RuntimeError("server did not report readiness for phase 1")
 
     # Start client to get session ticket
@@ -174,8 +180,9 @@ def capture_0rtt(
 
     client1_stdout = logs_dir / "phase1_client_stdout.log"
     client1_stderr = logs_dir / "phase1_client_stderr.log"
-    client1 = subprocess.Popen(
+    client1 = start_process(
         client1_cmd,
+        "TLS 1.3 initial client",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.PIPE,
@@ -203,7 +210,7 @@ def capture_0rtt(
         if verbose:
             print("[+] Waiting for the post-handshake session ticket")
         client1.stdin.close()
-    except Exception as e:
+    except (BrokenPipeError, OSError, ValueError) as e:
         if verbose:
             print(f"[!] Error closing client stdin: {e}")
 
@@ -221,8 +228,8 @@ def capture_0rtt(
     # second connection and the reader records the next key pair.
     server_phase1 = dict(eph_store_phase1["server"])
 
-    # Stop tshark (phase 1)
-    stop_tshark(tshark1, tshark1_threads)
+    # Finalize phase-1 packet capture.
+    stop_capture(capture1, capture1_threads)
 
     if verbose:
         print(f"[+] Phase 1 complete. Session ticket saved: {session_file}")
@@ -241,8 +248,8 @@ def capture_0rtt(
     if verbose:
         print("\n[PHASE 2] 0-RTT resumption with early data")
 
-    # Start tshark for phase 2
-    tshark2, tshark2_threads = start_tshark(
+    # Start packet capture for phase 2.
+    capture2, capture2_threads = start_capture(
         pcap_file_phase2, iface, port, logs_dir / "phase2", verbose
     )
 
@@ -252,7 +259,7 @@ def capture_0rtt(
         "client": {"priv": None, "pub": None},
     }
     if server1.poll() is not None:
-        stop_tshark(tshark2, tshark2_threads)
+        stop_capture(capture2, capture2_threads)
         raise RuntimeError("server exited before the resumption phase")
 
     # Start client with 0-RTT early data
@@ -281,8 +288,9 @@ def capture_0rtt(
 
     client2_stdout = logs_dir / "phase2_client_stdout.log"
     client2_stderr = logs_dir / "phase2_client_stderr.log"
-    client2 = subprocess.Popen(
+    client2 = start_process(
         client2_cmd,
+        "TLS 1.3 resumption client",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.PIPE,
@@ -306,7 +314,7 @@ def capture_0rtt(
     # Close stdin (early data already sent via -early_data file)
     try:
         client2.stdin.close()
-    except Exception:
+    except (BrokenPipeError, OSError, ValueError):
         pass
 
     # Wait for client to exit
@@ -325,11 +333,11 @@ def capture_0rtt(
     )
     if "Reused, TLSv1.3" not in phase2_summary:
         terminate(server1, "server")
-        stop_tshark(tshark2, tshark2_threads)
+        stop_capture(capture2, capture2_threads)
         raise RuntimeError("phase 2 did not resume the saved TLS 1.3 session")
     if "Early data was accepted" not in phase2_summary:
         terminate(server1, "server")
-        stop_tshark(tshark2, tshark2_threads)
+        stop_capture(capture2, capture2_threads)
         raise RuntimeError("phase 2 resumed, but the server rejected early data")
 
     # Stop the persistent server after both connections.
@@ -342,8 +350,8 @@ def capture_0rtt(
     eph_store_phase2["server"] = dict(eph_store_phase1["server"])
     eph_store_phase1["server"] = server_phase1
 
-    # Stop tshark (phase 2)
-    stop_tshark(tshark2, tshark2_threads)
+    # Finalize phase-2 packet capture.
+    stop_capture(capture2, capture2_threads)
 
     # Persist ephemeral keys for BOTH phases
     # Phase 1 keys (for breaking initial handshake)
@@ -447,6 +455,7 @@ def capture_0rtt(
             "keys/key.pem",
             "process logs",
         ],
+        recovery=recovery_spec("tls13", "0rtt", port),
     )
 
     # Report

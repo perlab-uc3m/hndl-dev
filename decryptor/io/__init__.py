@@ -10,6 +10,7 @@ from .pcap_parser import (
     list_tcp_stream_indices,
     get_tcp_stream_bytes,
     extract_first_handshake_message,
+    extract_tls_hello_pair,
     parse_client_random_from_ch,
     parse_cipher_from_server_hello,
     parse_client_keyshare_pub_from_ch,
@@ -31,7 +32,7 @@ from .key_material import (
     load_th_finished,
     save_th_finished,
 )
-from .file_paths import CapturePaths
+from .file_paths import CapturePaths, RecoveryArtifacts
 
 __all__ = [
     # pcap_parser
@@ -44,6 +45,7 @@ __all__ = [
     "list_tcp_stream_indices",
     "get_tcp_stream_bytes",
     "extract_first_handshake_message",
+    "extract_tls_hello_pair",
     "parse_client_random_from_ch",
     "parse_cipher_from_server_hello",
     "parse_client_keyshare_pub_from_ch",
@@ -65,4 +67,5 @@ __all__ = [
     "save_th_finished",
     # file_paths
     "CapturePaths",
+    "RecoveryArtifacts",
 ]

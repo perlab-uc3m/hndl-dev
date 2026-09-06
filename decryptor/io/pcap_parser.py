@@ -314,6 +314,50 @@ def extract_first_handshake_message(frame_bytes: bytes, expected_type: int) -> b
     raise ValueError("Failed to extract handshake message (likely fragmented)")
 
 
+def extract_tls_hello_pair(pcap: Path, port: int) -> tuple[bytes | None, bytes | None]:
+    """Extract ClientHello and ServerHello using increasingly broad fallbacks."""
+    client_hello = server_hello = None
+    client_frame = find_first_frame(pcap, "tls.handshake.type==1", port)
+    server_frame = find_first_frame(pcap, "tls.handshake.type==2", port)
+    if client_frame and server_frame:
+        try:
+            client_hello = extract_first_handshake_message(
+                hexdump_frame(pcap, client_frame, port), 1
+            )
+            server_hello = extract_first_handshake_message(
+                hexdump_frame(pcap, server_frame, port), 2
+            )
+        except (OSError, RuntimeError, ValueError):
+            client_hello = server_hello = None
+
+    if client_hello is None or server_hello is None:
+        for _, payload in iter_tcp_payloads(pcap, port):
+            if client_hello is None:
+                client_hello = parse_first_handshake_from_payload(payload, 1)
+            if server_hello is None:
+                server_hello = parse_first_handshake_from_payload(payload, 2)
+            if client_hello and server_hello:
+                break
+
+    if client_hello is None or server_hello is None:
+        for stream_index in list_tcp_stream_indices(pcap, port):
+            try:
+                side_a, side_b = get_tcp_stream_bytes(pcap, stream_index)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if client_hello is None:
+                client_hello = parse_first_handshake_from_payload(
+                    side_a, 1
+                ) or parse_first_handshake_from_payload(side_b, 1)
+            if server_hello is None:
+                server_hello = parse_first_handshake_from_payload(
+                    side_b, 2
+                ) or parse_first_handshake_from_payload(side_a, 2)
+            if client_hello and server_hello:
+                break
+    return client_hello, server_hello
+
+
 def parse_client_random_from_ch(client_hello_hs: bytes) -> bytes:
     """Extract 32-byte ClientHello.random."""
     if len(client_hello_hs) < 4 + 2 + 32:
