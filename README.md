@@ -60,6 +60,22 @@ python3 hndl.py -p tls13 -m 1rtt --capture-only
 python3 hndl.py -p tls13 --decrypt-only data/2025-...-tls13-1rtt-capture
 ```
 
+For a development check of every supported mode, run:
+
+```bash
+python3 scripts/smoke_test.py
+```
+
+This performs fresh TLS 1.2 RSA, TLS 1.3 1-RTT, genuine TLS 1.3 0-RTT,
+QUIC, and forced-rekey SSH captures on dynamically selected loopback ports. It
+requires the binaries from the setup section and working `dumpcap` permissions.
+The test fails on an incomplete pipeline, missing or empty evidence, packet
+drops, an SSH run with fewer than two authenticated transport epochs, or a
+leaked capture/server process. Artifacts are created outside the repository
+and removed after a complete pass; `--keep` retains them, and `--verbose`
+prints each pipeline's output. Each mode has a 90-second timeout by default;
+use `--timeout-seconds` on unusually slow systems.
+
 Output lands in `data/<timestamp>-<protocol>-capture/` with subdirectories
 `pcap/`, `keys/`, `logs/`, and `derived/`. TLS/QUIC derived secrets use NSS
 keylog format. SSH writes a JSON recovery record containing its reconstructed
@@ -128,7 +144,7 @@ decryptor/
     io/                 PCAP parsing, key material I/O
 analysis/               Cost models, mitigation experiments, figures
     results/            CSV data from experiments
-scripts/                Build scripts for patched OpenSSL/OpenSSH
+scripts/                Build scripts and the all-mode integration smoke test
 patches/                Source patches
 ```
 

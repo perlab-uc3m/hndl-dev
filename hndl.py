@@ -30,6 +30,7 @@ def run_capture(
     mode: str,
     port: int,
     verbose: bool,
+    data_root: Path,
     ssh_rekey_limit: str | None = None,
     ssh_payload_bytes: int = 0,
 ) -> Path:
@@ -41,6 +42,7 @@ def run_capture(
         cmd.extend(["--mode", mode])
     if port:
         cmd.extend(["--port", str(port)])
+    cmd.extend(["--data-root", str(data_root)])
     if verbose:
         cmd.append("--verbose")
     if protocol == "ssh" and ssh_rekey_limit:
@@ -52,7 +54,7 @@ def run_capture(
     if result.returncode != 0:
         sys.exit(1)
 
-    capture_dir = find_latest_capture(Path("data"), protocol, mode)
+    capture_dir = find_latest_capture(data_root, protocol, mode)
     if not capture_dir:
         print("Error: Could not find capture directory")
         sys.exit(1)
@@ -60,7 +62,9 @@ def run_capture(
     return capture_dir
 
 
-def run_decryption(capture_dir: Path, protocol: str, mode: str, debug: bool) -> bool:
+def run_decryption(
+    capture_dir: Path, protocol: str, mode: str, port: int, debug: bool
+) -> bool:
     """Run key derivation phase."""
     print(f"\n[DECRYPT] Deriving session keys...")
 
@@ -74,6 +78,8 @@ def run_decryption(capture_dir: Path, protocol: str, mode: str, debug: bool) -> 
         str(capture_dir),
         "--protocol",
         protocol,
+        "--port",
+        str(port),
     ]
 
     if mode:
@@ -119,6 +125,11 @@ def main():
     )
     parser.add_argument("--mode", "-m", help="tls13: 1rtt|0rtt, tls12: rsa")
     parser.add_argument("--port", type=int)
+    parser.add_argument(
+        "--data-root",
+        default="data",
+        help="Capture output directory (default: ./data)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--debug", "-d", action="store_true")
     parser.add_argument("--capture-only", action="store_true")
@@ -138,14 +149,18 @@ def main():
         args.mode = "rsa"
     # QUIC has no mode (always 1-RTT TLS 1.3 internally)
 
+    data_root = Path(args.data_root).resolve()
+    decrypt_only = Path(args.decrypt_only).resolve() if args.decrypt_only else None
     os.chdir(Path(__file__).parent)
 
     # Decrypt-only mode
-    if args.decrypt_only:
-        capture_dir = Path(args.decrypt_only)
+    if decrypt_only:
+        capture_dir = decrypt_only
         if not capture_dir.exists():
             sys.exit(f"Error: {capture_dir} not found")
-        success = run_decryption(capture_dir, args.protocol, args.mode, args.debug)
+        success = run_decryption(
+            capture_dir, args.protocol, args.mode, args.port, args.debug
+        )
         sys.exit(0 if success else 1)
 
     # Capture
@@ -154,6 +169,7 @@ def main():
         args.mode,
         args.port,
         args.verbose,
+        data_root,
         args.ssh_rekey_limit,
         args.ssh_payload_bytes,
     )
@@ -166,7 +182,9 @@ def main():
         sys.exit(0)
 
     # Decrypt
-    success = run_decryption(capture_dir, args.protocol, args.mode, args.debug)
+    success = run_decryption(
+        capture_dir, args.protocol, args.mode, args.port, args.debug
+    )
 
     # Summary
     print(f"\n{'=' * 60}")

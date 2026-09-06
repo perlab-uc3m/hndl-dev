@@ -7,7 +7,11 @@ from pathlib import Path
 
 
 def derive(
-    capture_dir: str, protocol: str, mode: str = None, debug: bool = False
+    capture_dir: str,
+    protocol: str,
+    mode: str = None,
+    debug: bool = False,
+    port: int = 44443,
 ) -> dict:
     """Dispatch key derivation to protocol-specific handler."""
     capture_path = Path(capture_dir)
@@ -21,16 +25,16 @@ def derive(
         if mode == "0rtt":
             from .tls13.derive_0rtt import derive_0rtt
 
-            return derive_0rtt(capture_path, debug=debug)
+            return derive_0rtt(capture_path, port=port, debug=debug)
         else:
             from .tls13.derive_1rtt import derive_1rtt
 
-            return derive_1rtt(capture_path, debug=debug)
+            return derive_1rtt(capture_path, port=port, debug=debug)
 
     elif protocol == "tls12":
         from .tls12.derive_rsa import derive_rsa
 
-        return derive_rsa(capture_path, debug=debug)
+        return derive_rsa(capture_path, port=port, debug=debug)
 
     elif protocol == "ssh":
         from .ssh.derive_ssh import derive_ssh
@@ -40,7 +44,7 @@ def derive(
     elif protocol == "quic":
         from .quic.derive_quic import derive_quic
 
-        return derive_quic(capture_path, debug=debug)
+        return derive_quic(capture_path, port=port, debug=debug)
 
     else:
         return {"success": False, "error": f"Unknown protocol: {protocol}"}
@@ -55,6 +59,7 @@ def main():
         "--protocol", choices=["tls13", "tls12", "ssh", "quic"], default="tls13"
     )
     parser.add_argument("--mode", help="tls13: 1rtt|0rtt, tls12: rsa")
+    parser.add_argument("--port", type=int, default=44443)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -64,7 +69,13 @@ def main():
     if args.protocol == "tls12" and not args.mode:
         args.mode = "rsa"
 
-    result = derive(args.capture_dir, args.protocol, args.mode, args.debug)
+    result = derive(
+        args.capture_dir,
+        args.protocol,
+        args.mode,
+        port=args.port,
+        debug=args.debug,
+    )
     if not result.get("success") and result.get("error"):
         print(f"Recovery failed: {result['error']}", file=sys.stderr)
     sys.exit(0 if result.get("success") else 1)
