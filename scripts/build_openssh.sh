@@ -1,4 +1,4 @@
-   #!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # ============================================================================
@@ -6,7 +6,9 @@ set -euo pipefail
 # ============================================================================
 #
 # Analogous to build_openssl.sh but for OpenSSH.
-# Used to capture SSH ephemeral key exchange secrets for traffic decryption.
+# The quantum-oracle hook exports only an ephemeral private value as the
+# simulated future recovery output. A separately labelled ground-truth channel
+# is compiled for validation and must never be consumed as an attack input.
 #
 # SSH Key Exchange (KEX) differs from TLS:
 #   - Uses Curve25519/ECDH/DH for key agreement
@@ -103,11 +105,18 @@ echov() { if [ "${VERBOSE:-0}" -eq 1 ]; then echo "$@"; fi }
 # Check for required build dependencies
 check_deps() {
   local missing=()
-  for cmd in gcc make autoconf automake git; do
+  for cmd in gcc make git; do
     if ! command -v "$cmd" &>/dev/null; then
       missing+=("$cmd")
     fi
   done
+  if [ ! -x "$SRC_DIR/configure" ]; then
+    for cmd in autoreconf autoconf automake; do
+      if ! command -v "$cmd" &>/dev/null; then
+        missing+=("$cmd")
+      fi
+    done
+  fi
   if [ ${#missing[@]} -gt 0 ]; then
     echo "WARNING: Missing dependencies: ${missing[*]}"
     echo "Install with: sudo apt install build-essential autoconf automake git zlib1g-dev libssl-dev libpam0g-dev"
@@ -143,8 +152,11 @@ download_source() {
     if git -C "$SRC_DIR" apply --check "$PATCH_FILE" 2>/dev/null; then
       git -C "$SRC_DIR" apply "$PATCH_FILE"
       echo "Patch applied successfully."
+    elif git -C "$SRC_DIR" apply --reverse --check "$PATCH_FILE" 2>/dev/null; then
+      echo "Patch is already applied."
     else
-      echo "Patch could not be cleanly applied (may already be applied or conflicts)."
+      echo "ERROR: Patch conflicts with the selected OpenSSH source." >&2
+      exit 1
     fi
   else
     echo "No patch applied (patch file not found or empty at $PATCH_FILE)."
@@ -162,10 +174,10 @@ build_openssh() {
   
   pushd "$SRC_DIR" > /dev/null
   
-  # Run autoreconf if configure doesn't exist or is outdated
-  # OpenSSH from git requires autoreconf; configure.ac may be newer than configure
-  if [ ! -f "configure" ] || [ "configure.ac" -nt "configure" ]; then
-    echov "Running autoreconf (configure missing or outdated)..."
+  # The tagged portable source includes configure. Regenerate it only when
+  # absent; comparing checkout mtimes causes needless autoreconf dependencies.
+  if [ ! -x "configure" ]; then
+    echov "Running autoreconf (configure missing)..."
     autoreconf -fvi
   fi
   
@@ -173,7 +185,7 @@ build_openssh() {
   ./configure --prefix="$LOCAL_PREFIX" \
     --with-privsep-path="${LOCAL_PREFIX}/var/empty" \
     --with-pid-dir="${LOCAL_PREFIX}/var/run" \
-    CFLAGS="-DSSH_KEYLOG_DEBUG=1 -g -O2"
+    CFLAGS="-DSSH_QUANTUM_ORACLE_DEBUG=1 -DSSH_GROUND_TRUTH_DEBUG=1 -g -O2"
   
   echov "Running make -j${JOBS}"
   make -j"${JOBS}"
@@ -257,14 +269,11 @@ explore_kex_code() {
 To create an SSH keylog patch similar to the OpenSSL TLS 1.3 patch:
 
 1. **kexc25519.c** - After kexc25519_keygen() generates keypair:
-   - Print: SSH_KEYLOG_CLIENT_EPHEMERAL_PRIV, SSH_KEYLOG_CLIENT_EPHEMERAL_PUB
-   - Print: SSH_KEYLOG_SERVER_EPHEMERAL_PUB (received from peer)
+   - Print: SSH_QUANTUM_EPHEMERAL_PRIV, SSH_QUANTUM_EPHEMERAL_PUB
+   - The capture process identifies whether the hook came from client or server
 
 2. **kex.c** - In kex_derive_keys() after computing shared secret K:
-   - Print: SSH_KEYLOG_SHARED_SECRET_K
-   - Print: SSH_KEYLOG_EXCHANGE_HASH_H
-   - Print: SSH_KEYLOG_SESSION_ID
-   - Print: SSH_KEYLOG_DERIVED_KEY_* (for each direction/purpose)
+   - Print SSH_GROUND_TRUTH_* values for post-reconstruction comparison only
 
 3. **Key derivation formula (RFC 4253)**:
    K = shared secret (ECDH result)
@@ -280,12 +289,13 @@ To create an SSH keylog patch similar to the OpenSSL TLS 1.3 patch:
    - MAC server->client: hash(K || H || "F" || session_id)
 
 4. **Output format** (similar to OpenSSL patch):
-   fprintf(stderr, "SSH_KEYLOG_SHARED_SECRET_K= ");
+   fprintf(stderr, "SSH_GROUND_TRUTH_SHARED_SECRET_K= ");
    for (i = 0; i < sshbuf_len(shared_secret); i++)
        fprintf(stderr, "%02x", sshbuf_ptr(shared_secret)[i]);
    fprintf(stderr, "\n");
 
-5. **Compile flag**: -DSSH_KEYLOG_DEBUG=1
+5. **Compile flags**: -DSSH_QUANTUM_ORACLE_DEBUG=1 and
+   -DSSH_GROUND_TRUTH_DEBUG=1
 PATCH_GUIDE
 
   echo ""

@@ -1,47 +1,29 @@
-# OpenSSH 9.9p2 SSH Key Exchange Debug Patch
+# OpenSSH 9.9p2 HN-DL experiment hook
 #
-# This patch adds debug output to OpenSSH 9.9p2 for SSH key exchange analysis.
-# It prints ephemeral keys, shared secrets, exchange hashes, session IDs,
-# and derived encryption/MAC keys to stderr when compiled with -DSSH_KEYLOG_DEBUG=1.
+# This patch exposes two deliberately separate evidence channels:
 #
-# Debug outputs:
-#   - SSH_KEYLOG_EPHEMERAL_PRIV/PUB: Curve25519 ephemeral keypair
-#   - SSH_KEYLOG_CLIENT_PUB: Client's public key (server-side)
-#   - SSH_KEYLOG_SERVER_PUB: Server's public key (client-side)
-#   - SSH_KEYLOG_SHARED_SECRET_RAW: Raw Curve25519 shared secret
-#   - SSH_KEYLOG_SHARED_SECRET_K: Encoded shared secret K (mpint format)
-#   - SSH_KEYLOG_EXCHANGE_HASH_H: Exchange hash H
-#   - SSH_KEYLOG_SESSION_ID: Session ID (first H)
-#   - SSH_KEYLOG_IV_CLIENT_TO_SERVER: IV for client->server (key 'A')
-#   - SSH_KEYLOG_IV_SERVER_TO_CLIENT: IV for server->client (key 'B')
-#   - SSH_KEYLOG_ENC_KEY_CLIENT_TO_SERVER: Encryption key client->server (key 'C')
-#   - SSH_KEYLOG_ENC_KEY_SERVER_TO_CLIENT: Encryption key server->client (key 'D')
-#   - SSH_KEYLOG_MAC_KEY_CLIENT_TO_SERVER: MAC key client->server (key 'E')
-#   - SSH_KEYLOG_MAC_KEY_SERVER_TO_CLIENT: MAC key server->client (key 'F')
+#   SSH_QUANTUM_*: the ephemeral private value that stands in for the output of
+#     a future solution of the public Curve25519 problem. This is the only
+#     endpoint secret admitted to the reconstruction path.
+#   SSH_GROUND_TRUTH_*: endpoint-computed values used only after reconstruction
+#     for byte-for-byte validation. They are not attack inputs.
 #
-# Key derivation per RFC 4253:
-#   K = shared secret (ECDH/Curve25519 result)
-#   H = hash(V_C || V_S || I_C || I_S || K_S || e || f || K)
-#   session_id = first H (for initial key exchange)
-#   Key 'X' = hash(K || H || "X" || session_id), extended if needed
+# Build with:
+#   CFLAGS="-DSSH_QUANTUM_ORACLE_DEBUG=1 -DSSH_GROUND_TRUTH_DEBUG=1 -g -O2"
 #
-# Usage:
-#   Apply this patch to OpenSSH 9.9p2 source, then build with:
-#   ./configure CFLAGS="-DSSH_KEYLOG_DEBUG=1 -g -O2" --prefix=/path/to/install
-#   make && make install
-#
-#   Run ssh/sshd and capture stderr to get key material.
-#
+# The output blocks lock stderr so concurrent OpenSSH diagnostics cannot split
+# or corrupt a hexadecimal evidence record.
+
 diff --git a/kex.c b/kex.c
-index 6b957e5..c7bdd60 100644
+index 6b957e5..9722e1b 100644
 --- a/kex.c
 +++ b/kex.c
-@@ -1109,6 +1109,26 @@ derive_key(struct ssh *ssh, int id, u_int need, u_char *hash, u_int hashlen,
+@@ -1109,6 +1109,28 @@ derive_key(struct ssh *ssh, int id, u_int need, u_char *hash, u_int hashlen,
  #ifdef DEBUG_KEX
  	fprintf(stderr, "key '%c'== ", c);
  	dump_digest("key", digest, need);
 +#endif
-+#ifdef SSH_KEYLOG_DEBUG
++#ifdef SSH_GROUND_TRUTH_DEBUG
 +	{
 +		size_t idx;
 +		/* Key labels: A=IV_C2S, B=IV_S2C, C=ENC_C2S, D=ENC_S2C, E=MAC_C2S, F=MAC_S2C */
@@ -51,123 +33,137 @@ index 6b957e5..c7bdd60 100644
 +			"MAC_KEY_CLIENT_TO_SERVER", "MAC_KEY_SERVER_TO_CLIENT"
 +		};
 +		int key_idx = c - 'A';
++		flockfile(stderr);
 +		if (key_idx >= 0 && key_idx < 6) {
-+			fprintf(stderr, "SSH_KEYLOG_%s= ", key_names[key_idx]);
++			fprintf(stderr, "SSH_GROUND_TRUTH_%s= ", key_names[key_idx]);
 +		} else {
-+			fprintf(stderr, "SSH_KEYLOG_KEY_%c= ", c);
++			fprintf(stderr, "SSH_GROUND_TRUTH_KEY_%c= ", c);
 +		}
 +		for (idx = 0; idx < need; idx++)
 +			fprintf(stderr, "%02x", digest[idx]);
 +		fprintf(stderr, "\n");
++		funlockfile(stderr);
 +	}
  #endif
  	*keyp = digest;
  	digest = NULL;
-@@ -1129,6 +1149,20 @@ kex_derive_keys(struct ssh *ssh, u_char *hash, u_int hashlen,
+@@ -1129,6 +1151,22 @@ kex_derive_keys(struct ssh *ssh, u_char *hash, u_int hashlen,
  	u_int i, j, mode, ctos;
  	int r;
  
-+#ifdef SSH_KEYLOG_DEBUG
++#ifdef SSH_GROUND_TRUTH_DEBUG
 +	{
 +		size_t idx;
-+		fprintf(stderr, "SSH_KEYLOG_SHARED_SECRET_K= ");
++		flockfile(stderr);
++		fprintf(stderr, "SSH_GROUND_TRUTH_SHARED_SECRET_K= ");
 +		for (idx = 0; idx < sshbuf_len(shared_secret); idx++)
 +			fprintf(stderr, "%02x", sshbuf_ptr(shared_secret)[idx]);
 +		fprintf(stderr, "\n");
-+		fprintf(stderr, "SSH_KEYLOG_EXCHANGE_HASH_H= ");
++		fprintf(stderr, "SSH_GROUND_TRUTH_EXCHANGE_HASH_H= ");
 +		for (idx = 0; idx < hashlen; idx++)
 +			fprintf(stderr, "%02x", hash[idx]);
 +		fprintf(stderr, "\n");
++		funlockfile(stderr);
 +	}
 +#endif
 +
  	/* save initial hash as session id */
  	if ((kex->flags & KEX_INITIAL) != 0) {
  		if (sshbuf_len(kex->session_id) != 0) {
-@@ -1137,6 +1171,15 @@ kex_derive_keys(struct ssh *ssh, u_char *hash, u_int hashlen,
+@@ -1137,6 +1175,17 @@ kex_derive_keys(struct ssh *ssh, u_char *hash, u_int hashlen,
  		}
  		if ((r = sshbuf_put(kex->session_id, hash, hashlen)) != 0)
  			return r;
-+#ifdef SSH_KEYLOG_DEBUG
++#ifdef SSH_GROUND_TRUTH_DEBUG
 +		{
 +			size_t idx;
-+			fprintf(stderr, "SSH_KEYLOG_SESSION_ID= ");
++			flockfile(stderr);
++			fprintf(stderr, "SSH_GROUND_TRUTH_SESSION_ID= ");
 +			for (idx = 0; idx < hashlen; idx++)
 +				fprintf(stderr, "%02x", hash[idx]);
 +			fprintf(stderr, "\n");
++			funlockfile(stderr);
 +		}
 +#endif
  	} else if (sshbuf_len(kex->session_id) == 0) {
  		error_f("no session ID in rekex");
  		return SSH_ERR_INTERNAL_ERROR;
 diff --git a/kexc25519.c b/kexc25519.c
-index e106521..1519ff0 100644
+index e106521..c7474a9 100644
 --- a/kexc25519.c
 +++ b/kexc25519.c
-@@ -53,6 +53,20 @@ kexc25519_keygen(u_char key[CURVE25519_SIZE], u_char pub[CURVE25519_SIZE])
+@@ -53,6 +53,22 @@ kexc25519_keygen(u_char key[CURVE25519_SIZE], u_char pub[CURVE25519_SIZE])
  
  	arc4random_buf(key, CURVE25519_SIZE);
  	crypto_scalarmult_curve25519(pub, key, basepoint);
 +
-+#ifdef SSH_KEYLOG_DEBUG
++#ifdef SSH_QUANTUM_ORACLE_DEBUG
 +	{
 +		size_t i;
-+		fprintf(stderr, "SSH_KEYLOG_EPHEMERAL_PRIV= ");
++		flockfile(stderr);
++		fprintf(stderr, "SSH_QUANTUM_EPHEMERAL_PRIV= ");
 +		for (i = 0; i < CURVE25519_SIZE; i++)
 +			fprintf(stderr, "%02x", key[i]);
 +		fprintf(stderr, "\n");
-+		fprintf(stderr, "SSH_KEYLOG_EPHEMERAL_PUB= ");
++		fprintf(stderr, "SSH_QUANTUM_EPHEMERAL_PUB= ");
 +		for (i = 0; i < CURVE25519_SIZE; i++)
 +			fprintf(stderr, "%02x", pub[i]);
 +		fprintf(stderr, "\n");
++		funlockfile(stderr);
 +	}
 +#endif
  }
  
  int
-@@ -70,6 +84,15 @@ kexc25519_shared_key_ext(const u_char key[CURVE25519_SIZE],
+@@ -70,6 +86,17 @@ kexc25519_shared_key_ext(const u_char key[CURVE25519_SIZE],
  	if (timingsafe_bcmp(zero, shared_key, CURVE25519_SIZE) == 0)
  		return SSH_ERR_KEY_INVALID_EC_VALUE;
  
-+#ifdef SSH_KEYLOG_DEBUG
++#ifdef SSH_GROUND_TRUTH_DEBUG
 +	{
 +		size_t i;
-+		fprintf(stderr, "SSH_KEYLOG_SHARED_SECRET_RAW= ");
++		flockfile(stderr);
++		fprintf(stderr, "SSH_GROUND_TRUTH_SHARED_SECRET_RAW= ");
 +		for (i = 0; i < CURVE25519_SIZE; i++)
 +			fprintf(stderr, "%02x", shared_key[i]);
 +		fprintf(stderr, "\n");
++		funlockfile(stderr);
 +	}
 +#endif
  #ifdef DEBUG_KEXECDH
  	dump_digest("shared secret 25519", shared_key, CURVE25519_SIZE);
  #endif
-@@ -129,6 +152,15 @@ kex_c25519_enc(struct kex *kex, const struct sshbuf *client_blob,
+@@ -129,6 +156,17 @@ kex_c25519_enc(struct kex *kex, const struct sshbuf *client_blob,
  		goto out;
  	}
  	client_pub = sshbuf_ptr(client_blob);
-+#ifdef SSH_KEYLOG_DEBUG
++#ifdef SSH_GROUND_TRUTH_DEBUG
 +	{
 +		size_t i;
-+		fprintf(stderr, "SSH_KEYLOG_CLIENT_PUB= ");
++		flockfile(stderr);
++		fprintf(stderr, "SSH_GROUND_TRUTH_CLIENT_PUB= ");
 +		for (i = 0; i < CURVE25519_SIZE; i++)
 +			fprintf(stderr, "%02x", client_pub[i]);
 +		fprintf(stderr, "\n");
++		funlockfile(stderr);
 +	}
 +#endif
  #ifdef DEBUG_KEXECDH
  	dump_digest("client public key 25519:", client_pub, CURVE25519_SIZE);
  #endif
-@@ -177,6 +209,15 @@ kex_c25519_dec(struct kex *kex, const struct sshbuf *server_blob,
+@@ -177,6 +215,17 @@ kex_c25519_dec(struct kex *kex, const struct sshbuf *server_blob,
  		goto out;
  	}
  	server_pub = sshbuf_ptr(server_blob);
-+#ifdef SSH_KEYLOG_DEBUG
++#ifdef SSH_GROUND_TRUTH_DEBUG
 +	{
 +		size_t i;
-+		fprintf(stderr, "SSH_KEYLOG_SERVER_PUB= ");
++		flockfile(stderr);
++		fprintf(stderr, "SSH_GROUND_TRUTH_SERVER_PUB= ");
 +		for (i = 0; i < CURVE25519_SIZE; i++)
 +			fprintf(stderr, "%02x", server_pub[i]);
 +		fprintf(stderr, "\n");
++		funlockfile(stderr);
 +	}
 +#endif
  #ifdef DEBUG_KEXECDH

@@ -197,11 +197,29 @@ def start_tshark(
                 "tshark exited before capture started.\n"
                 f"stdout:\n{out}\n\nstderr:\n{err}"
             )
-            sys.exit(msg)
+            raise RuntimeError(msg)
         if tshark_ready.is_set():
             break
         time.sleep(0.1)
     time.sleep(0.2)
+
+    if tshark.poll() is not None:
+        for t in (t_out, t_err):
+            t.join(timeout=1)
+        err = (
+            tshark_err_log.read_text(errors="replace")
+            if tshark_err_log.exists()
+            else ""
+        )
+        out = (
+            tshark_out_log.read_text(errors="replace")
+            if tshark_out_log.exists()
+            else ""
+        )
+        raise RuntimeError(
+            "tshark exited before capture started.\n"
+            f"stdout:\n{out}\n\nstderr:\n{err}"
+        )
 
     return tshark, (t_out, t_err)
 

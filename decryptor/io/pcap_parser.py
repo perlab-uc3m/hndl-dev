@@ -166,14 +166,15 @@ def get_first_tcp_stream_index(pcap: Path, port: int) -> int:
     return -1
 
 
-def list_tcp_stream_indices(pcap: Path, port: int) -> list[int]:
-    """Return all unique tcp.stream indices for traffic on port."""
+def list_tcp_stream_indices(pcap: Path, port: int | None = None) -> list[int]:
+    """Return unique TCP stream indices, optionally restricted to a port."""
+    display_filter = "tcp" if port is None else f"tcp.port=={port}"
     cmd = [
         "tshark",
         "-r",
         str(pcap),
         "-Y",
-        f"tcp.port=={port}",
+        display_filter,
         "-T",
         "fields",
         "-e",
@@ -195,33 +196,27 @@ def list_tcp_stream_indices(pcap: Path, port: int) -> list[int]:
 
 
 def parse_follow_tcp_raw_output(raw_text: str) -> tuple[bytes, bytes]:
-    """Parse tshark follow,tcp,raw output into (client_to_server, server_to_client)."""
-    c2s = bytearray()
-    s2c = bytearray()
-    current = None
+    """Parse tshark ``follow,tcp,raw`` output into its two endpoint streams."""
+    node0 = bytearray()
+    node1 = bytearray()
+    saw_nodes = False
     for line in raw_text.splitlines():
-        line = line.rstrip("\n")
-        low = line.lower()
-        if "client to server" in low:
-            current = c2s
+        if line.startswith("Node 0:"):
+            saw_nodes = True
             continue
-        if "server to client" in low:
-            current = s2c
+        if line.startswith("Node 1:"):
+            saw_nodes = True
             continue
-        if current is None:
+        if not saw_nodes:
             continue
-        tokens = line.strip().split()
-        hexpairs = []
-        for tok in tokens:
-            t = tok.strip()
-            if all(ch in "0123456789abcdef" for ch in t.lower()) and len(t) == 2:
-                hexpairs.append(t)
-        if hexpairs:
-            try:
-                current.extend(binascii.unhexlify("".join(hexpairs)))
-            except Exception:
-                pass
-    return bytes(c2s), bytes(s2c)
+        encoded = line.strip()
+        if not encoded or not re.fullmatch(r"[0-9a-fA-F]+", encoded):
+            continue
+        if len(encoded) % 2:
+            raise ValueError("Odd-length hex data in tshark follow output")
+        target = node1 if line.startswith("\t") else node0
+        target.extend(binascii.unhexlify(encoded))
+    return bytes(node0), bytes(node1)
 
 
 def get_tcp_stream_bytes(pcap: Path, stream_index: int) -> tuple[bytes, bytes]:

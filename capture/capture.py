@@ -66,6 +66,17 @@ def main():
         default=None,
         help="Custom folder label suffix (default: auto-generated)",
     )
+    ap.add_argument(
+        "--ssh-rekey-limit",
+        default=None,
+        help="OpenSSH RekeyLimit for an SSH experiment (for example 64K)",
+    )
+    ap.add_argument(
+        "--ssh-payload-bytes",
+        type=int,
+        default=0,
+        help="Zero bytes to send before the SSH recovery marker",
+    )
     ap.add_argument("--verbose", action="store_true", help="Print detailed progress")
 
     args = ap.parse_args()
@@ -103,7 +114,15 @@ def main():
         ]:
             ensure_exec(bin_path, name)
         result = capture_ssh(
-            sshd, ssh_bin, ssh_keygen, args.iface, args.port, capture_root, args.verbose
+            sshd,
+            ssh_bin,
+            ssh_keygen,
+            args.iface,
+            args.port,
+            capture_root,
+            args.verbose,
+            args.ssh_rekey_limit,
+            args.ssh_payload_bytes,
         )
     elif args.version == "tls13":
         openssl = Path(args.openssl)

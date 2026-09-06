@@ -1,24 +1,122 @@
 #!/usr/bin/env python3
-"""SSH capture with ephemeral key logging via patched OpenSSH."""
+"""SSH capture with separated simulated-quantum and ground-truth hooks."""
 
 import json
+import hashlib
 import os
+import platform
 import re
+import select
+import socket
 import subprocess
+import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from ..common import terminate, tcp_port_open, start_tshark, stop_tshark
+from ..common import terminate, start_tshark, stop_tshark
 
-# Regex for SSH keylog output from patched OpenSSH
-SSH_KEYLOG_RE = re.compile(r"SSH_KEYLOG_(\w+)=\s*([0-9a-fA-F]+)")
+SSH_QUANTUM_RE = re.compile(r"SSH_QUANTUM_(\w+)=\s*([0-9a-fA-F]+)")
+SSH_GROUND_TRUTH_RE = re.compile(
+    r"SSH_GROUND_TRUTH_(\w+)=\s*([0-9a-fA-F]+)"
+)
+
+
+def _sha256(path: Path) -> str:
+    """Return a stable content hash for one evidence or implementation file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _version_output(command: list[str]) -> str:
+    """Collect a tool version without making capture success depend on it."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        return (result.stdout + result.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"unavailable: {exc}"
+
+
+def record_ssh_streams(
+    listen_port: int,
+    target_port: int,
+    client_to_server_file: Path,
+    server_to_client_file: Path,
+    ready_event: threading.Event,
+    stop_event: threading.Event,
+    errors: list,
+):
+    """Forward one loopback SSH connection while recording its wire bytes."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        listener.bind(("127.0.0.1", listen_port))
+        listener.listen(1)
+        listener.settimeout(0.2)
+        ready_event.set()
+
+        downstream = None
+        while downstream is None and not stop_event.is_set():
+            try:
+                downstream, _ = listener.accept()
+            except socket.timeout:
+                continue
+        if downstream is None:
+            return
+
+        upstream = socket.create_connection(("127.0.0.1", target_port), timeout=3)
+        downstream.setblocking(False)
+        upstream.setblocking(False)
+        peers = {downstream: upstream, upstream: downstream}
+        outputs = {downstream: client_to_server_file, upstream: server_to_client_file}
+        active = {downstream, upstream}
+
+        with client_to_server_file.open("wb") as c2s, server_to_client_file.open(
+            "wb"
+        ) as s2c:
+            handles = {
+                client_to_server_file: c2s,
+                server_to_client_file: s2c,
+            }
+            while active and not stop_event.is_set():
+                readable, _, _ = select.select(list(active), [], [], 0.2)
+                for source in readable:
+                    try:
+                        data = source.recv(65536)
+                    except BlockingIOError:
+                        continue
+                    if not data:
+                        active.discard(source)
+                        try:
+                            peers[source].shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        continue
+                    handle = handles[outputs[source]]
+                    handle.write(data)
+                    handle.flush()
+                    peers[source].sendall(data)
+        downstream.close()
+        upstream.close()
+    except Exception as exc:
+        errors.append(exc)
+        ready_event.set()
+    finally:
+        listener.close()
 
 
 def ssh_reader_thread(
-    pipe, logfile: Path, keylog: dict, ready_event: threading.Event = None
+    pipe,
+    logfile: Path,
+    quantum_output: dict,
+    ground_truth: dict,
+    ready_event: threading.Event = None,
 ):
-    """Read SSH process output, extract keylog entries, detect readiness."""
+    """Persist process output and keep oracle data separate from ground truth."""
     logfile.parent.mkdir(parents=True, exist_ok=True)
     with logfile.open("wb") as f:
         for raw in iter(pipe.readline, b""):
@@ -26,9 +124,46 @@ def ssh_reader_thread(
             line = raw.decode(errors="replace").rstrip()
             if ready_event and "Server listening" in line:
                 ready_event.set()
-            m = SSH_KEYLOG_RE.search(line)
-            if m:
-                keylog[m.group(1)] = m.group(2).lower()
+            quantum_match = SSH_QUANTUM_RE.search(line)
+            if quantum_match:
+                name, value = quantum_match.group(1), quantum_match.group(2).lower()
+                quantum_output.setdefault("records", []).append(
+                    {"name": name, "value": value}
+                )
+                # Keep the first value under the legacy scalar key so initial-
+                # exchange consumers cannot silently switch to the last rekey.
+                quantum_output.setdefault(name, value)
+            truth_match = SSH_GROUND_TRUTH_RE.search(line)
+            if truth_match:
+                name, value = truth_match.group(1), truth_match.group(2).lower()
+                ground_truth.setdefault("records", []).append(
+                    {"name": name, "value": value}
+                )
+                ground_truth.setdefault(name, value)
+
+
+def _quantum_recoveries(hook_output: dict) -> list[dict]:
+    """Pair each private/public hook record without collapsing later rekeys."""
+    recoveries = []
+    pending_private = None
+    for record in hook_output.get("records", []):
+        if record["name"] == "EPHEMERAL_PRIV":
+            if pending_private is not None:
+                raise RuntimeError("quantum hook emitted two private values without a public value")
+            pending_private = record["value"]
+        elif record["name"] == "EPHEMERAL_PUB":
+            if pending_private is None:
+                raise RuntimeError("quantum hook emitted a public value without a private value")
+            recoveries.append(
+                {
+                    "ephemeral_private": pending_private,
+                    "ephemeral_public": record["value"],
+                }
+            )
+            pending_private = None
+    if pending_private is not None:
+        raise RuntimeError("quantum hook ended with an unpaired private value")
+    return recoveries
 
 
 def generate_host_key(ssh_keygen: Path, keys_dir: Path, verbose: bool = False) -> Path:
@@ -60,9 +195,14 @@ def generate_user_key(ssh_keygen: Path, keys_dir: Path, verbose: bool = False) -
 
 
 def write_sshd_config(
-    config_path: Path, host_key: Path, auth_keys: Path, port: int
+    config_path: Path,
+    host_key: Path,
+    auth_keys: Path,
+    port: int,
+    rekey_limit: str | None = None,
 ) -> Path:
     """Write minimal sshd_config for testing."""
+    rekey_line = f"\nRekeyLimit {rekey_limit}" if rekey_limit else ""
     config_path.write_text(
         f"""
 Port {port}
@@ -76,6 +216,10 @@ StrictModes no
 UsePAM no
 Subsystem sftp /usr/lib/openssh/sftp-server
 LogLevel DEBUG3
+KexAlgorithms curve25519-sha256
+Ciphers chacha20-poly1305@openssh.com
+HostKeyAlgorithms ssh-ed25519
+{rekey_line}
 """.strip()
         + "\n"
     )
@@ -90,13 +234,17 @@ def capture_ssh(
     port: int,
     capture_root: Path,
     verbose: bool = False,
+    rekey_limit: str | None = None,
+    payload_bytes: int = 0,
 ) -> dict:
-    """Capture SSH session with ephemeral key extraction."""
+    """Capture one forced-classical SSH session for HN-DL reconstruction."""
     # Ensure all paths are absolute (sshd requires absolute paths)
     sshd = Path(sshd).resolve()
     ssh = Path(ssh).resolve()
     ssh_keygen = Path(ssh_keygen).resolve()
     capture_root = Path(capture_root).resolve()
+    if payload_bytes < 0:
+        raise ValueError("SSH payload size cannot be negative")
 
     pcap_dir = capture_root / "pcap"
     logs_dir = capture_root / "logs"
@@ -105,18 +253,35 @@ def capture_ssh(
         d.mkdir(parents=True, exist_ok=True)
 
     pcap_file = pcap_dir / "ssh_session.pcapng"
+    client_stream_file = pcap_dir / "ssh_client_to_server.bin"
+    server_stream_file = pcap_dir / "ssh_server_to_client.bin"
+    backend_port = port + 1
     host_key = generate_host_key(ssh_keygen, keys_dir, verbose)
     user_key = generate_user_key(ssh_keygen, keys_dir, verbose)
     auth_keys = keys_dir / "authorized_keys"
-    sshd_config = write_sshd_config(keys_dir / "sshd_config", host_key, auth_keys, port)
+    sshd_config = write_sshd_config(
+        keys_dir / "sshd_config", host_key, auth_keys, backend_port, rekey_limit
+    )
 
-    keylog = {"server": {}, "client": {}}
+    quantum_output = {"server": {}, "client": {}}
+    ground_truth = {"server": {}, "client": {}}
 
     if verbose:
         print(f"[+] Output dir: {capture_root}")
 
-    # Start tshark
-    tshark, tshark_threads = start_tshark(pcap_file, iface, port, logs_dir, verbose)
+    # Capture the public-side connection. The byte-recording relay is also an
+    # exact transport-stream archive and permits deterministic testing when the
+    # host has not granted dumpcap capture capabilities.
+    tshark = None
+    tshark_threads = None
+    tshark_error = None
+    try:
+        tshark, tshark_threads = start_tshark(
+            pcap_file, iface, port, logs_dir, verbose
+        )
+    except RuntimeError as exc:
+        tshark_error = str(exc)
+        print(f"[!] PCAP capture unavailable; retaining SSH wire streams: {exc}")
 
     # Start sshd (debug mode, no fork)
     sshd_cmd = [str(sshd), "-D", "-d", "-f", str(sshd_config), "-h", str(host_key)]
@@ -132,7 +297,8 @@ def capture_ssh(
         args=(
             server.stderr,
             logs_dir / "sshd_stderr.log",
-            keylog["server"],
+            quantum_output["server"],
+            ground_truth["server"],
             server_ready,
         ),
     )
@@ -145,10 +311,44 @@ def capture_ssh(
     for _ in range(50):
         if server.poll() is not None:
             break
-        if server_ready.is_set() or tcp_port_open("127.0.0.1", port):
+        if server_ready.is_set():
             break
         time.sleep(0.1)
+    if server.poll() is not None:
+        t_srv.join(timeout=1)
+        if tshark is not None:
+            stop_tshark(tshark, tshark_threads)
+        detail = (logs_dir / "sshd_stderr.log").read_text(errors="replace")
+        raise RuntimeError(f"sshd exited before becoming ready:\n{detail}")
+    if not server_ready.is_set():
+        terminate(server, "sshd")
+        if tshark is not None:
+            stop_tshark(tshark, tshark_threads)
+        raise RuntimeError("sshd did not report readiness")
     time.sleep(0.3)
+
+    proxy_ready = threading.Event()
+    proxy_stop = threading.Event()
+    proxy_errors = []
+    t_proxy = threading.Thread(
+        target=record_ssh_streams,
+        args=(
+            port,
+            backend_port,
+            client_stream_file,
+            server_stream_file,
+            proxy_ready,
+            proxy_stop,
+            proxy_errors,
+        ),
+        daemon=True,
+    )
+    t_proxy.start()
+    if not proxy_ready.wait(timeout=3) or proxy_errors:
+        terminate(server, "sshd")
+        if tshark is not None:
+            stop_tshark(tshark, tshark_threads)
+        raise RuntimeError(f"SSH recording relay failed: {proxy_errors}")
 
     # Start ssh client
     ssh_cmd = [
@@ -166,54 +366,233 @@ def capture_ssh(
         f"IdentityFile={user_key}",
         "-o",
         "BatchMode=yes",
-        "-p",
-        str(port),
-        f"{os.getenv('USER', 'test')}@127.0.0.1",
-        "echo SSH_TEST_OK; exit 0",
+        "-o",
+        "KexAlgorithms=curve25519-sha256",
+        "-o",
+        "Ciphers=chacha20-poly1305@openssh.com",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519",
     ]
+    if rekey_limit:
+        ssh_cmd.extend(["-o", f"RekeyLimit={rekey_limit}"])
+    if payload_bytes:
+        remote_command = f"head -c {payload_bytes} /dev/zero; echo SSH_TEST_OK"
+    else:
+        remote_command = "echo SSH_TEST_OK; exit 0"
+    ssh_cmd.extend(
+        [
+            "-p",
+            str(port),
+            f"{os.getenv('USER', 'test')}@127.0.0.1",
+            remote_command,
+        ]
+    )
     if verbose:
         print(f"[+] Starting ssh: {' '.join(ssh_cmd)}")
 
+    application_output = logs_dir / "application_stdout.bin"
+    application_handle = application_output.open("wb")
     client = subprocess.Popen(
-        ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid
+        ssh_cmd,
+        stdout=application_handle,
+        stderr=subprocess.PIPE,
+        preexec_fn=os.setsid,
     )
     t_cli = threading.Thread(
         target=ssh_reader_thread,
-        args=(client.stderr, logs_dir / "ssh_stderr.log", keylog["client"]),
+        args=(
+            client.stderr,
+            logs_dir / "ssh_stderr.log",
+            quantum_output["client"],
+            ground_truth["client"],
+        ),
     )
     t_cli.daemon = True
     t_cli.start()
 
     # Wait for client
+    client_error = None
     try:
-        stdout, _ = client.communicate(timeout=10)
+        timeout = max(10, payload_bytes // 1_000_000 * 5)
+        returncode = client.wait(timeout=timeout)
+        application_handle.close()
+        stdout = application_output.read_bytes()
+        t_cli.join(timeout=1)
         if verbose and stdout:
-            print(f"[+] Client output: {stdout.decode(errors='replace').strip()}")
+            print(
+                f"[+] Client output: {len(stdout)} bytes; "
+                f"marker_present={b'SSH_TEST_OK' in stdout}"
+            )
+        if returncode != 0 or b"SSH_TEST_OK" not in stdout:
+            detail = (logs_dir / "ssh_stderr.log").read_text(errors="replace")
+            client_error = RuntimeError(
+                f"SSH client failed (exit {returncode}); output={stdout!r}\n{detail}"
+            )
     except subprocess.TimeoutExpired:
         if verbose:
             print("[!] Client timeout")
         terminate(client, "ssh")
+        application_handle.close()
+        client_error = RuntimeError("SSH client timed out")
 
     time.sleep(0.5)
     terminate(server, "sshd")
-    stop_tshark(tshark, tshark_threads)
+    t_proxy.join(timeout=2)
+    if t_proxy.is_alive():
+        proxy_stop.set()
+        t_proxy.join(timeout=1)
+    if tshark is not None:
+        stop_tshark(tshark, tshark_threads)
+    t_srv.join(timeout=1)
+    t_cli.join(timeout=1)
+    if proxy_errors:
+        raise RuntimeError(f"SSH recording relay failed: {proxy_errors}")
+    if client_error is not None:
+        raise client_error
 
-    # Save keylog
-    keylog_file = keys_dir / "ssh_keylog.json"
-    with keylog_file.open("w") as f:
-        json.dump(keylog, f, indent=2)
+    client_oracle = quantum_output["client"]
+    recoveries = _quantum_recoveries(client_oracle)
+    if not recoveries:
+        raise RuntimeError("patched SSH client did not emit the quantum-oracle hook")
+
+    oracle_file = keys_dir / "simulated_quantum_output.json"
+    with oracle_file.open("w") as f:
+        json.dump(
+            {
+                "model": "future-recovery-output",
+                "algorithm": "curve25519-sha256",
+                "recovered_side": "client",
+                "ephemeral_private": recoveries[0]["ephemeral_private"],
+                "ephemeral_public_check": recoveries[0]["ephemeral_public"],
+                "recoveries": recoveries,
+            },
+            f,
+            indent=2,
+        )
+
+    truth_file = keys_dir / "ssh_ground_truth.json"
+    with truth_file.open("w") as f:
+        json.dump(ground_truth, f, indent=2)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    implementation_paths = [
+        repo_root / "patches" / "openssh-9.9p2-keylog.patch",
+        Path(__file__).resolve(),
+        repo_root / "capture" / "common.py",
+        repo_root / "decryptor" / "ssh" / "derive_ssh.py",
+        repo_root / "decryptor" / "core" / "ssh_crypto.py",
+        repo_root / "decryptor" / "io" / "pcap_parser.py",
+    ]
+    evidence_paths = [
+        pcap_file,
+        client_stream_file,
+        server_stream_file,
+        oracle_file,
+        truth_file,
+        sshd_config,
+        host_key,
+        host_key.with_name(host_key.name + ".pub"),
+        user_key,
+        user_key.with_name(user_key.name + ".pub"),
+        auth_keys,
+        logs_dir / "ssh_stderr.log",
+        logs_dir / "sshd_stderr.log",
+        logs_dir / "tshark_stdout.log",
+        logs_dir / "tshark_stderr.log",
+        application_output,
+    ]
+    git_commit = _version_output(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"]
+    ).splitlines()[0]
+    git_dirty = bool(
+        _version_output(["git", "-C", str(repo_root), "status", "--porcelain"])
+    )
+    manifest = {
+        "schema": "hndl-ssh-run-manifest-v1",
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "experiment": {
+            "protocol": "SSH-2",
+            "openssh_target": "9.9p2",
+            "kex": "curve25519-sha256",
+            "host_key": "ssh-ed25519",
+            "cipher_c2s": "chacha20-poly1305@openssh.com",
+            "cipher_s2c": "chacha20-poly1305@openssh.com",
+            "network": "IPv4 loopback via transparent recording relay",
+            "public_port": port,
+            "backend_port": backend_port,
+            "rekey_limit": rekey_limit,
+            "payload_bytes": payload_bytes,
+            "pcap_available": pcap_file.exists() and pcap_file.stat().st_size > 0,
+            "pcap_error": tshark_error,
+        },
+        "commands": {"sshd": sshd_cmd, "ssh": ssh_cmd},
+        "software": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "uname": list(platform.uname()),
+            "ssh_version": _version_output([str(ssh), "-V"]),
+            "sshd_version": _version_output([str(sshd), "-V"]),
+            "tshark_version": _version_output(["tshark", "--version"]),
+            "repository_commit": git_commit,
+            "repository_dirty": git_dirty,
+        },
+        "binary_sha256": {
+            str(path): _sha256(path) for path in (ssh, sshd, ssh_keygen)
+        },
+        "implementation_sha256": {
+            str(path.relative_to(repo_root)): _sha256(path)
+            for path in implementation_paths
+            if path.exists()
+        },
+        "artifacts": {
+            str(path.relative_to(capture_root)): {
+                "bytes": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+            for path in evidence_paths
+            if path.exists()
+        },
+        "evidence_boundary": {
+            "attack_inputs": [
+                "pcap/ssh_session.pcapng or both direction-separated wire streams",
+                "keys/simulated_quantum_output.json",
+            ],
+            "excluded_from_attack_inputs": [
+                "keys/ssh_ground_truth.json",
+                "keys/ssh_host_ed25519_key and public key",
+                "keys/user_ed25519_key, public key, and authorized_keys",
+                "logs/application_stdout.bin",
+                "logs/ssh_stderr.log and logs/sshd_stderr.log",
+            ],
+        },
+    }
+    manifest_file = capture_root / "manifest.json"
+    with manifest_file.open("w") as f:
+        json.dump(manifest, f, indent=2)
 
     # Report
     print("SSH capture complete.")
-    print(f"- PCAP: {pcap_file}")
-    print(f"- Keylog: {keylog_file}")
+    if pcap_file.exists() and pcap_file.stat().st_size:
+        print(f"- PCAP: {pcap_file}")
+    else:
+        print("- PCAP: unavailable on this host")
+    print(f"- Client-to-server wire stream: {client_stream_file}")
+    print(f"- Server-to-client wire stream: {server_stream_file}")
+    print(f"- Simulated quantum output: {oracle_file}")
+    print(f"- Comparison-only ground truth: {truth_file}")
+    print(f"- Reproduction manifest: {manifest_file}")
     print(f"- Host key: {host_key}")
     print(f"- User key: {user_key}")
 
     return {
         "mode": "ssh",
         "pcap": str(pcap_file),
-        "keylog": str(keylog_file),
+        "client_to_server_stream": str(client_stream_file),
+        "server_to_client_stream": str(server_stream_file),
+        "pcap_error": tshark_error,
+        "simulated_quantum_output": str(oracle_file),
+        "ground_truth": str(truth_file),
+        "manifest": str(manifest_file),
         "host_key": str(host_key),
         "user_key": str(user_key),
         "logs": str(logs_dir),

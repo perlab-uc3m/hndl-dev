@@ -25,7 +25,14 @@ def find_latest_capture(data_dir: Path, protocol: str, mode: str = None) -> Path
     return captures[0] if captures else None
 
 
-def run_capture(protocol: str, mode: str, port: int, verbose: bool) -> Path:
+def run_capture(
+    protocol: str,
+    mode: str,
+    port: int,
+    verbose: bool,
+    ssh_rekey_limit: str | None = None,
+    ssh_payload_bytes: int = 0,
+) -> Path:
     """Run capture phase."""
     print(f"\n[HARVEST] Capturing {protocol.upper()} traffic...")
 
@@ -36,6 +43,10 @@ def run_capture(protocol: str, mode: str, port: int, verbose: bool) -> Path:
         cmd.extend(["--port", str(port)])
     if verbose:
         cmd.append("--verbose")
+    if protocol == "ssh" and ssh_rekey_limit:
+        cmd.extend(["--ssh-rekey-limit", ssh_rekey_limit])
+    if protocol == "ssh" and ssh_payload_bytes:
+        cmd.extend(["--ssh-payload-bytes", str(ssh_payload_bytes)])
 
     result = subprocess.run(cmd)
     if result.returncode != 0:
@@ -95,6 +106,8 @@ def main():
     parser.add_argument("--debug", "-d", action="store_true")
     parser.add_argument("--capture-only", action="store_true")
     parser.add_argument("--decrypt-only", metavar="DIR")
+    parser.add_argument("--ssh-rekey-limit", help="SSH RekeyLimit, e.g. 64K")
+    parser.add_argument("--ssh-payload-bytes", type=int, default=0)
     args = parser.parse_args()
 
     # Defaults
@@ -119,7 +132,14 @@ def main():
         sys.exit(0 if success else 1)
 
     # Capture
-    capture_dir = run_capture(args.protocol, args.mode, args.port, args.verbose)
+    capture_dir = run_capture(
+        args.protocol,
+        args.mode,
+        args.port,
+        args.verbose,
+        args.ssh_rekey_limit,
+        args.ssh_payload_bytes,
+    )
 
     if args.capture_only:
         print(f"\nCapture saved: {capture_dir}")
@@ -139,7 +159,13 @@ def main():
     if success:
         keylog = get_keylog_path(capture_dir, args.protocol, args.mode)
         print(f"Keylog:  {keylog}")
-        print(f"PCAP:    {capture_dir}/pcap/")
+        pcap = capture_dir / "pcap" / f"{args.protocol}_session.pcapng"
+        if pcap.exists() and pcap.stat().st_size:
+            print(f"PCAP:    {pcap}")
+        elif args.protocol == "ssh":
+            print(f"Archive: {capture_dir}/pcap/ssh_*_to_*.bin")
+        else:
+            print(f"PCAP:    {capture_dir}/pcap/")
 
     sys.exit(0 if success else 1)
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Experiment B — SSH aggressive rekeying mitigation.
 
-Measures how SSH RekeyLimit increases independent DH exchanges (E)
-and associated storage overhead.
+Measures how SSH RekeyLimit increases distinct DH exchanges and associated
+storage overhead. Whether their attack inputs are simultaneously schedulable
+is a separate dependency question; this script does not infer wall-clock
+quantum latency from the exchange count.
 """
 
 import argparse
@@ -32,7 +34,6 @@ sys.path.insert(0, str(REPO_ROOT))
 from capture.common import (
     ensure_exec,
     check_tool,
-    tcp_port_open,
     start_tshark,
     stop_tshark,
     reader_thread,
@@ -146,9 +147,16 @@ def capture_ssh_rekey(
     host_key = generate_host_key(ssh_keygen, keys_dir, verbose)
     user_key = generate_user_key(ssh_keygen, keys_dir, verbose)
     auth_keys = keys_dir / "authorized_keys"
-    sshd_config = write_sshd_config(keys_dir / "sshd_config", host_key, auth_keys, port)
+    sshd_config = write_sshd_config(
+        keys_dir / "sshd_config",
+        host_key,
+        auth_keys,
+        port,
+        rekey_limit_str if rekey_limit_str != "0" else None,
+    )
 
-    keylog: dict = {"server": {}, "client": {}}
+    quantum_output: dict = {"server": {}, "client": {}}
+    ground_truth: dict = {"server": {}, "client": {}}
     tshark, tshark_threads = start_tshark(pcap_file, "lo", port, logs_dir, verbose)
 
     sshd_cmd = [str(sshd), "-D", "-d", "-f", str(sshd_config), "-h", str(host_key)]
@@ -161,7 +169,8 @@ def capture_ssh_rekey(
         args=(
             server.stderr,
             logs_dir / "sshd_stderr.log",
-            keylog["server"],
+            quantum_output["server"],
+            ground_truth["server"],
             server_ready,
         ),
     )
@@ -171,7 +180,7 @@ def capture_ssh_rekey(
     for _ in range(50):
         if server.poll() is not None:
             break
-        if server_ready.is_set() or tcp_port_open("127.0.0.1", port):
+        if server_ready.is_set():
             break
         time.sleep(0.1)
     time.sleep(0.3)
@@ -217,7 +226,12 @@ def capture_ssh_rekey(
     )
     t_cli = threading.Thread(
         target=ssh_reader_thread,
-        args=(client.stderr, logs_dir / "ssh_stderr.log", keylog["client"]),
+        args=(
+            client.stderr,
+            logs_dir / "ssh_stderr.log",
+            quantum_output["client"],
+            ground_truth["client"],
+        ),
     )
     t_cli.daemon = True
     t_cli.start()
@@ -550,7 +564,8 @@ def main():
                         tmp_path,
                     )
                     alpha = pcap_bytes / payload
-                    # E = number of independent DH exchanges = NEWKEYS count
+                    # E counts distinct DH exchanges. It is not elapsed-time
+                    # multiplication without a validated dependency schedule.
                     e = max(1, newkeys_count)
                     results.append(
                         (
