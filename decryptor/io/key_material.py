@@ -2,7 +2,6 @@
 """Key material I/O: ephemeral keys, diagnostics, traces."""
 
 import json
-import sys
 from pathlib import Path
 
 
@@ -11,7 +10,7 @@ def read_json(path: Path):
     try:
         return json.loads(path.read_text())
     except Exception as e:
-        sys.exit(f"Failed to read {path}: {e}")
+        raise ValueError(f"failed to read {path}: {e}") from e
 
 
 def load_ephemeral_keys(capture_dir: Path):
@@ -19,6 +18,20 @@ def load_ephemeral_keys(capture_dir: Path):
     server_e = read_json(capture_dir / "keys/server_ephemeral.json")
     client_e = read_json(capture_dir / "keys/client_ephemeral.json")
     return server_e, client_e
+
+
+def load_simulated_recovery(capture_dir: Path) -> dict:
+    """Load the sole asymmetric-recovery artifact consumed by derivation."""
+    recovery = read_json(capture_dir / "keys/simulated_quantum_output.json")
+    required = ("role", "group", "ephemeral_private", "ephemeral_public_check")
+    missing = [name for name in required if not recovery.get(name)]
+    if missing:
+        raise ValueError(
+            "simulated recovery artifact is missing: " + ", ".join(missing)
+        )
+    if recovery["role"] not in ("client", "server"):
+        raise ValueError("simulated recovery role must be 'client' or 'server'")
+    return recovery
 
 
 def save_diagnostics(derived_dir: Path, diagnostics: dict, debug: bool = False):

@@ -62,7 +62,10 @@ def print_secret_comparison(
     title: str, truth: dict[str, str], derived: dict[str, str], verbose: bool = False
 ):
     """Print comparison of truth vs derived secrets."""
-    labels = sorted(set(truth.keys()) | set(derived.keys()))
+    # A missing reference must never make validation pass vacuously.  Only the
+    # secrets the attack claims to derive are required; unrelated reference
+    # labels (for example EXPORTER_SECRET) are ignored.
+    labels = sorted(derived.keys())
     if not labels:
         return 0, 0
     ok = 0
@@ -70,8 +73,8 @@ def print_secret_comparison(
     for lab in labels:
         t = truth.get(lab)
         d = derived.get(lab)
+        total += 1
         if t and d:
-            total += 1
             if t.lower() == d.lower():
                 ok += 1
                 if verbose:

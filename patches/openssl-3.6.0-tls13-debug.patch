@@ -1,46 +1,62 @@
 # OpenSSL 3.6.0 TLS 1.3 Debug Patch
 #
-# This patch adds debug output to OpenSSL 3.6.0 for TLS 1.3 handshake analysis.
-# It prints ephemeral keys, shared secrets, transcript hashes, and intermediate
-# HKDF derivation values to stderr when compiled with -DDEMO_PRINT_EPHEMERAL=1.
-#
-# Debug outputs:
-#   - DEMO_EPHEMERAL_PRIV/PUB: ECDHE ephemeral keys
-#   - DEMO_SHARED_SECRET_Z: ECDHE shared secret
-#   - DEMO_TRANSCRIPT_HASH_HS: Transcript hash for handshake traffic secrets
-#   - DEMO_TRANSCRIPT_HASH_FINISHED: Transcript hash including server Finished
-#   - DEMO_TLS13_INPUT_SECRET: Input secret to tls13_generate_secret()
-#   - DEMO_TLS13_PREV_SECRET: Previous secret in key schedule
-#   - DEMO_DERIVED_SECRET: Output of tls13_generate_secret()
-#
-# Usage:
-#   Apply this patch to OpenSSL 3.6.0 source, then build with:
-#   ./Configure no-shared -DDEMO_PRINT_EPHEMERAL=1 --prefix=/path/to/install
-#
+# Apply to tag openssl-3.6.0 (commit 7b371d80d959ec9ab4139d09d78e83c090de9779).
+# The ephemeral private value models the result of future asymmetric recovery.
+# Shared secrets, transcript hashes, and HKDF intermediates are comparison-only
+# endpoint ground truth and must not be supplied to the recovery path.
+# Build with -DDEMO_PRINT_EPHEMERAL=1.
+
 diff --git a/ssl/s3_lib.c b/ssl/s3_lib.c
-index 226493a..modified 100644
+index 226493a..7dd9e80 100644
 --- a/ssl/s3_lib.c
 +++ b/ssl/s3_lib.c
-@@ -4965,6 +4965,25 @@ EVP_PKEY *ssl_generate_pkey(SSL_CONNECTION *s, EVP_PKEY *pm)
+@@ -4967,6 +4967,27 @@ EVP_PKEY *ssl_generate_pkey(SSL_CONNECTION *s, EVP_PKEY *pm)
          pkey = NULL;
      }
  
 +#if defined(DEMO_PRINT_EPHEMERAL) && DEMO_PRINT_EPHEMERAL
-+    /* DEMO: Print the ephemeral private and public keys.
-+     * ERR_clear_error() prevents debug probes from polluting the error
-+     * stack, which would otherwise abort the QUIC handshake layer. */
 +    if (pkey != NULL) {
-+        unsigned char priv_buf[32], pub_buf[65];
++        unsigned char priv_buf[80], pub_buf[160];
 +        size_t priv_len = sizeof(priv_buf), pub_len = sizeof(pub_buf);
 +
 +        if (EVP_PKEY_get_raw_private_key(pkey, priv_buf, &priv_len) > 0) {
 +            fprintf(stderr, "DEMO_EPHEMERAL_PRIV= ");
-+            for (size_t i = 0; i < priv_len; ++i) fprintf(stderr, "%02x", priv_buf[i]);
++            for (size_t i = 0; i < priv_len; ++i)
++                fprintf(stderr, "%02x", priv_buf[i]);
 +            fprintf(stderr, "\n");
 +        }
 +        if (EVP_PKEY_get_raw_public_key(pkey, pub_buf, &pub_len) > 0) {
 +            fprintf(stderr, "DEMO_EPHEMERAL_PUB= ");
-+            for (size_t i = 0; i < pub_len; ++i) fprintf(stderr, "%02x", pub_buf[i]);
++            for (size_t i = 0; i < pub_len; ++i)
++                fprintf(stderr, "%02x", pub_buf[i]);
++            fprintf(stderr, "\n");
++        }
++        ERR_clear_error();
++    }
++#endif
++
+     err:
+     EVP_PKEY_CTX_free(pctx);
+     return pkey;
+@@ -5006,6 +5027,27 @@ EVP_PKEY *ssl_generate_pkey_group(SSL_CONNECTION *s, uint16_t id)
+         pkey = NULL;
+     }
+ 
++#if defined(DEMO_PRINT_EPHEMERAL) && DEMO_PRINT_EPHEMERAL
++    if (pkey != NULL) {
++        unsigned char priv_buf[80], pub_buf[160];
++        size_t priv_len = sizeof(priv_buf), pub_len = sizeof(pub_buf);
++
++        if (EVP_PKEY_get_raw_private_key(pkey, priv_buf, &priv_len) > 0) {
++            fprintf(stderr, "DEMO_EPHEMERAL_PRIV= ");
++            for (size_t i = 0; i < priv_len; ++i)
++                fprintf(stderr, "%02x", priv_buf[i]);
++            fprintf(stderr, "\n");
++        }
++        if (EVP_PKEY_get_raw_public_key(pkey, pub_buf, &pub_len) > 0) {
++            fprintf(stderr, "DEMO_EPHEMERAL_PUB= ");
++            for (size_t i = 0; i < pub_len; ++i)
++                fprintf(stderr, "%02x", pub_buf[i]);
 +            fprintf(stderr, "\n");
 +        }
 +        ERR_clear_error();
@@ -50,89 +66,59 @@ index 226493a..modified 100644
   err:
      EVP_PKEY_CTX_free(pctx);
      return pkey;
-@@ -5006,6 +5026,26 @@ EVP_PKEY *ssl_generate_pkey_group(SSL_CONNECTION *s, uint16_t id)
-         pkey = NULL;
-     }
- 
-+#if defined(DEMO_PRINT_EPHEMERAL) && DEMO_PRINT_EPHEMERAL
-+    /* DEMO: Print the ephemeral private and public keys.
-+     * ERR_clear_error() prevents debug probes from polluting the error
-+     * stack, which would otherwise abort the QUIC handshake layer. */
-+    if (pkey != NULL) {
-+        unsigned char priv_buf[32], pub_buf[65];
-+        size_t priv_len = sizeof(priv_buf), pub_len = sizeof(pub_buf);
-+
-+        if (EVP_PKEY_get_raw_private_key(pkey, priv_buf, &priv_len) > 0) {
-+            fprintf(stderr, "DEMO_EPHEMERAL_PRIV= ");
-+            for (size_t i = 0; i < priv_len; ++i) fprintf(stderr, "%02x", priv_buf[i]);
-+            fprintf(stderr, "\n");
-+        }
-+        if (EVP_PKEY_get_raw_public_key(pkey, pub_buf, &pub_len) > 0) {
-+            fprintf(stderr, "DEMO_EPHEMERAL_PUB= ");
-+            for (size_t i = 0; i < pub_len; ++i) fprintf(stderr, "%02x", pub_buf[i]);
-+            fprintf(stderr, "\n");
-+        }
-+        ERR_clear_error();
-+    }
-+#endif
-+
-  err:
-     EVP_PKEY_CTX_free(pctx);
-     return pkey;
-@@ -5114,6 +5152,13 @@ int ssl_derive(SSL_CONNECTION *s, EVP_PKEY *privkey, EVP_PKEY *pubkey, int gense
-         rv = 1;
+@@ -5111,6 +5153,13 @@ int ssl_derive(SSL_CONNECTION *s, EVP_PKEY *privkey, EVP_PKEY *pubkey, int gense
+         goto err;
      }
  
 +#if defined(DEMO_PRINT_EPHEMERAL) && DEMO_PRINT_EPHEMERAL
 +    fprintf(stderr, "DEMO_SHARED_SECRET_Z[len=%zu]= ", pmslen);
-+    for (size_t i = 0; i < pmslen; ++i) {
++    for (size_t i = 0; i < pmslen; ++i)
 +        fprintf(stderr, "%02x", pms[i]);
-+    }
 +    fprintf(stderr, "\n");
 +#endif
-  err:
-     OPENSSL_clear_free(pms, pmslen);
-     EVP_PKEY_CTX_free(pctx);
- 
++
+     if (gensecret) {
+         /* SSLfatal() called as appropriate in the below functions */
+         rv = ssl_gensecret(s, pms, pmslen);
 diff --git a/ssl/tls13_enc.c b/ssl/tls13_enc.c
-index f28e2c8..modified 100644
+index 5953de3..cfd1c85 100644
 --- a/ssl/tls13_enc.c
 +++ b/ssl/tls13_enc.c
-@@ -106,6 +106,18 @@ int tls13_hkdf_expand(SSL_CONNECTION *s, const EVP_MD *md,
+@@ -106,6 +106,16 @@ int tls13_hkdf_expand(SSL_CONNECTION *s, const EVP_MD *md,
      int ret;
      SSL_CTX *sctx = SSL_CONNECTION_GET_CTX(s);
  
 +#if defined(DEMO_PRINT_EPHEMERAL) && DEMO_PRINT_EPHEMERAL
-+    /* DEMO: Print transcript hash when deriving handshake traffic secrets */
-+    if (data != NULL && datalen > 0 && labellen > 0) {
-+        /* Check if this is a handshake traffic secret (label ends with "hs traffic") */
-+        if (labellen >= 10 && memcmp(label + labellen - 10, "hs traffic", 10) == 0) {
-+            fprintf(stderr, "DEMO_TRANSCRIPT_HASH_HS[len=%zu]= ", datalen);
-+            for (size_t i = 0; i < datalen; ++i) fprintf(stderr, "%02x", data[i]);
-+            fprintf(stderr, "\n");
-+        }
++    if (data != NULL && datalen > 0 && labellen >= 10
++            && memcmp(label + labellen - 10, "hs traffic", 10) == 0) {
++        fprintf(stderr, "DEMO_TRANSCRIPT_HASH_HS[len=%zu]= ", datalen);
++        for (size_t i = 0; i < datalen; ++i)
++            fprintf(stderr, "%02x", data[i]);
++        fprintf(stderr, "\n");
 +    }
 +#endif
 +
      ret = tls13_hkdf_expand_ex(sctx->libctx, sctx->propq, md,
                                 secret, label, labellen, data, datalen,
                                 out, outlen, !fatal);
-@@ -179,6 +191,23 @@ int tls13_generate_secret(SSL_CONNECTION *s, const EVP_MD *md,
+@@ -179,6 +189,25 @@ int tls13_generate_secret(SSL_CONNECTION *s, const EVP_MD *md,
      static const char derived_secret_label[] = "\x64\x65\x72\x69\x76\x65\x64";
      SSL_CTX *sctx = SSL_CONNECTION_GET_CTX(s);
  
 +#if defined(DEMO_PRINT_EPHEMERAL) && DEMO_PRINT_EPHEMERAL
-+    /* DEMO: Print the input secret (which might be Z for handshake secrets) */
 +    if (insecret != NULL && insecretlen > 0) {
 +        fprintf(stderr, "DEMO_TLS13_INPUT_SECRET[len=%zu]= ", insecretlen);
-+        for (size_t i = 0; i < insecretlen; ++i) fprintf(stderr, "%02x", insecret[i]);
++        for (size_t i = 0; i < insecretlen; ++i)
++            fprintf(stderr, "%02x", insecret[i]);
 +        fprintf(stderr, "\n");
 +    }
 +    if (prevsecret != NULL) {
-+        mdleni = EVP_MD_get_size(md);
-+        if (mdleni > 0) {
-+            fprintf(stderr, "DEMO_TLS13_PREV_SECRET[len=%d]= ", mdleni);
-+            for (int i = 0; i < mdleni; ++i) fprintf(stderr, "%02x", prevsecret[i]);
++        int demo_mdlen = EVP_MD_get_size(md);
++
++        if (demo_mdlen > 0) {
++            fprintf(stderr, "DEMO_TLS13_PREV_SECRET[len=%d]= ", demo_mdlen);
++            for (int i = 0; i < demo_mdlen; ++i)
++                fprintf(stderr, "%02x", prevsecret[i]);
 +            fprintf(stderr, "\n");
 +        }
 +    }
@@ -146,10 +132,10 @@ index f28e2c8..modified 100644
      ret = EVP_KDF_derive(kctx, outsecret, mdlen, params) <= 0;
  
 +#if defined(DEMO_PRINT_EPHEMERAL) && DEMO_PRINT_EPHEMERAL
-+    /* DEMO: Print the derived secret (output of this function) */
 +    if (ret == 0) {
 +        fprintf(stderr, "DEMO_DERIVED_SECRET[len=%zu]= ", mdlen);
-+        for (size_t i = 0; i < mdlen; ++i) fprintf(stderr, "%02x", outsecret[i]);
++        for (size_t i = 0; i < mdlen; ++i)
++            fprintf(stderr, "%02x", outsecret[i]);
 +        fprintf(stderr, "\n");
 +    }
 +#endif
@@ -157,26 +143,23 @@ index f28e2c8..modified 100644
      if (ret != 0)
          SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
  
-diff --git a/ssl/tls13_enc.c b/ssl/tls13_enc.c
-index 5953de3..adf6ce4 100644
---- a/ssl/tls13_enc.c
-+++ b/ssl/tls13_enc.c
-@@ -662,6 +662,19 @@ int tls13_change_cipher_state(SSL_CONNECTION *s, int which)
+@@ -662,6 +700,20 @@ int tls13_change_cipher_state(SSL_CONNECTION *s, int which)
          }
      }
  
 +#if defined(DEMO_PRINT_EPHEMERAL) && DEMO_PRINT_EPHEMERAL
-+    /* DEMO: Print server_finished_hash (th_finished) when deriving application secrets */
-+    /* Application traffic is when we're not doing EARLY or HANDSHAKE */
-+    if (((which & SSL3_CC_EARLY) == 0) && ((which & SSL3_CC_HANDSHAKE) == 0) && s->server_finished_hash != NULL) {
-+        size_t hashlen_tmp = EVP_MD_get_size(ssl_handshake_md(s));
-+        fprintf(stderr, "DEMO_TRANSCRIPT_HASH_FINISHED[len=%zu]= ", hashlen_tmp);
-+        for (size_t i = 0; i < hashlen_tmp; ++i)
-+            fprintf(stderr, "%02x", s->server_finished_hash[i]);
-+        fprintf(stderr, "\n");
++    if ((which & (SSL3_CC_EARLY | SSL3_CC_HANDSHAKE)) == 0) {
++        int demo_hashlen = EVP_MD_get_size(ssl_handshake_md(s));
++
++        if (demo_hashlen > 0) {
++            fprintf(stderr, "DEMO_TRANSCRIPT_HASH_FINISHED[len=%d]= ",
++                    demo_hashlen);
++            for (int i = 0; i < demo_hashlen; ++i)
++                fprintf(stderr, "%02x", s->server_finished_hash[i]);
++            fprintf(stderr, "\n");
++        }
 +    }
 +#endif
-+
 +
      if ((which & SSL3_CC_EARLY) == 0) {
          md = ssl_handshake_md(s);

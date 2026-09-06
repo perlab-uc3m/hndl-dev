@@ -30,13 +30,13 @@ sys.path.insert(0, str(REPO_ROOT))
 from capture.common import (
     ensure_exec,
     check_tool,
-    tcp_port_open,
     generate_cert_key,
     start_tshark,
     stop_tshark,
     reader_thread,
     terminate,
 )
+from decryptor.io import run_tshark
 
 # ---------------------------------------------------------------------------
 # Plot style
@@ -72,14 +72,16 @@ def pcap_total_bytes(pcap_path: Path, skip_pure_acks: bool = True) -> int:
         "-e",
         "tcp.len",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_tshark(cmd, pcap_path)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or "tshark failed while measuring PCAP")
     total = 0
     for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 2:
+        parts = line.split("\t")
+        if not parts or not parts[0].strip().isdigit():
             continue
-        frame_len = int(parts[0])
-        tcp_len_str = parts[1]
+        frame_len = int(parts[0].strip())
+        tcp_len_str = parts[1].strip() if len(parts) > 1 else ""
         if skip_pure_acks and tcp_len_str.isdigit() and int(tcp_len_str) == 0:
             continue
         total += frame_len
@@ -176,10 +178,15 @@ def capture_tls13_padded(
 
     for _ in range(50):
         if server.poll() is not None:
-            sys.exit("TLS server exited prematurely")
-        if server_accept_event.is_set() or tcp_port_open("127.0.0.1", port):
+            stop_tshark(tshark, tshark_threads)
+            raise RuntimeError("TLS server exited before becoming ready")
+        if server_accept_event.is_set():
             break
         time.sleep(0.1)
+    if not server_accept_event.is_set():
+        terminate(server, "server")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError("TLS server did not report readiness")
 
     client_cmd = [
         str(openssl),
@@ -233,10 +240,20 @@ def capture_tls13_padded(
         client.wait(timeout=15)
     except subprocess.TimeoutExpired:
         terminate(client, "client")
+    t_cli_out.join(timeout=1)
+    t_cli_err.join(timeout=1)
+    if client.returncode != 0:
+        terminate(server, "server")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError(f"TLS client failed with status {client.returncode}")
 
     time.sleep(0.5)
     terminate(server, "server")
     stop_tshark(tshark, tshark_threads)
+
+    response = (logs_dir / "cli_out.log").read_bytes()
+    if b"A" * min(32, payload_bytes) not in response:
+        raise RuntimeError("TLS client did not receive the controlled payload")
 
     return pcap_total_bytes(pcap_file)
 

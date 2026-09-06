@@ -1,6 +1,7 @@
 """PCAP parsing and key material I/O."""
 
 from .pcap_parser import (
+    run_tshark,
     hexdump_frame,
     find_first_frame,
     iter_tcp_payloads,
@@ -16,10 +17,13 @@ from .pcap_parser import (
     extract_decrypted_handshake_from_tshark,
     parse_new_session_ticket,
     parse_client_hello_without_binders,
+    verify_tls_http_request,
+    verify_quic_stream_data,
 )
 from .key_material import (
     read_json,
     load_ephemeral_keys,
+    load_simulated_recovery,
     save_diagnostics,
     save_key_schedule_trace,
     save_transcript_hashes,
@@ -31,6 +35,7 @@ from .file_paths import CapturePaths
 
 __all__ = [
     # pcap_parser
+    "run_tshark",
     "hexdump_frame",
     "find_first_frame",
     "iter_tcp_payloads",
@@ -46,9 +51,12 @@ __all__ = [
     "extract_decrypted_handshake_from_tshark",
     "parse_new_session_ticket",
     "parse_client_hello_without_binders",
+    "verify_tls_http_request",
+    "verify_quic_stream_data",
     # key_material
     "read_json",
     "load_ephemeral_keys",
+    "load_simulated_recovery",
     "save_diagnostics",
     "save_key_schedule_trace",
     "save_transcript_hashes",

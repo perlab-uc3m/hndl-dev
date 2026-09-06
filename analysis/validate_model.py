@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Empirical validation of the HN-DL storage-cost model.
 
-Runs real captures at controlled payloads for TLS 1.2, TLS 1.3, and SSH,
+Runs real captures at controlled payloads for TLS 1.2, TLS 1.3, QUIC, and SSH,
 then overlays measured α on the theoretical curves from cost_analysis.py.
 """
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -31,7 +30,6 @@ sys.path.insert(0, str(REPO_ROOT))
 from capture.common import (
     ensure_exec,
     check_tool,
-    tcp_port_open,
     generate_cert_key,
     start_tshark,
     stop_tshark,
@@ -46,7 +44,15 @@ from capture.ssh.capture_ssh import (
 )
 
 # Re-use the protocol models from cost_analysis so curves are always in sync.
-from analysis.cost_analysis import PROTOCOLS, TLS12_RSA, TLS13_1RTT, SSH_X25519
+from analysis.cost_analysis import (
+    PROTOCOLS,
+    TLS12_RSA,
+    TLS13_1RTT,
+    QUIC_X25519,
+    SSH_X25519,
+)
+from capture.quic.capture_quic import capture_quic
+from decryptor.io import run_tshark
 
 # ---------------------------------------------------------------------------
 # Plot style (matching cost_analysis.py)
@@ -80,14 +86,16 @@ def pcap_total_bytes(pcap_path: Path, skip_pure_acks: bool = True) -> int:
         "-e",
         "tcp.len",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_tshark(cmd, pcap_path)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or "tshark failed while measuring PCAP")
     total = 0
     for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 2:
+        parts = line.split("\t")
+        if not parts or not parts[0].strip().isdigit():
             continue
-        frame_len = int(parts[0])
-        tcp_len_str = parts[1]
+        frame_len = int(parts[0].strip())
+        tcp_len_str = parts[1].strip() if len(parts) > 1 else ""
         # tcp.len is empty for non-TCP frames; keep those
         if skip_pure_acks and tcp_len_str.isdigit() and int(tcp_len_str) == 0:
             continue
@@ -190,10 +198,15 @@ def _capture_tls_controlled(
 
     for _ in range(50):
         if server.poll() is not None:
-            sys.exit("TLS server exited prematurely")
-        if server_accept_event.is_set() or tcp_port_open("127.0.0.1", port):
+            stop_tshark(tshark, tshark_threads)
+            raise RuntimeError("TLS server exited before becoming ready")
+        if server_accept_event.is_set():
             break
         time.sleep(0.1)
+    if not server_accept_event.is_set():
+        terminate(server, "server")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError("TLS server did not report readiness")
 
     # Client sends a GET for the payload file.
     client_cmd = [
@@ -252,10 +265,20 @@ def _capture_tls_controlled(
         client.wait(timeout=15)
     except subprocess.TimeoutExpired:
         terminate(client, "client")
+    t_cli_out.join(timeout=1)
+    t_cli_err.join(timeout=1)
+    if client.returncode != 0:
+        terminate(server, "server")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError(f"TLS client failed with status {client.returncode}")
 
     time.sleep(0.5)
     terminate(server, "server")
     stop_tshark(tshark, tshark_threads)
+
+    response = (logs_dir / "cli_out.log").read_bytes()
+    if b"A" * min(32, payload_bytes) not in response:
+        raise RuntimeError("TLS client did not receive the controlled payload")
 
     return pcap_total_bytes(pcap_file)
 
@@ -282,7 +305,8 @@ def _capture_ssh_controlled(
     auth_keys = keys_dir / "authorized_keys"
     sshd_config = write_sshd_config(keys_dir / "sshd_config", host_key, auth_keys, port)
 
-    keylog: dict = {"server": {}, "client": {}}
+    quantum_output: dict = {"server": {}, "client": {}}
+    ground_truth: dict = {"server": {}, "client": {}}
     tshark, tshark_threads = start_tshark(pcap_file, "lo", port, logs_dir, verbose)
 
     sshd_cmd = [str(sshd), "-D", "-d", "-f", str(sshd_config), "-h", str(host_key)]
@@ -295,7 +319,8 @@ def _capture_ssh_controlled(
         args=(
             server.stderr,
             logs_dir / "sshd_stderr.log",
-            keylog["server"],
+            quantum_output["server"],
+            ground_truth["server"],
             server_ready,
         ),
     )
@@ -305,9 +330,13 @@ def _capture_ssh_controlled(
     for _ in range(50):
         if server.poll() is not None:
             break
-        if server_ready.is_set() or tcp_port_open("127.0.0.1", port):
+        if server_ready.is_set():
             break
         time.sleep(0.1)
+    if server.poll() is not None or not server_ready.is_set():
+        terminate(server, "sshd")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError("sshd did not report readiness")
     time.sleep(0.3)
 
     # Stream exactly payload_bytes from server to client.
@@ -336,15 +365,22 @@ def _capture_ssh_controlled(
     if verbose:
         print(f"  [ssh] {' '.join(ssh_cmd)}")
 
+    application_output = logs_dir / "application_stdout.bin"
+    application_handle = application_output.open("wb")
     client = subprocess.Popen(
         ssh_cmd,
-        stdout=subprocess.DEVNULL,
+        stdout=application_handle,
         stderr=subprocess.PIPE,
         preexec_fn=os.setsid,
     )
     t_cli = threading.Thread(
         target=ssh_reader_thread,
-        args=(client.stderr, logs_dir / "ssh_stderr.log", keylog["client"]),
+        args=(
+            client.stderr,
+            logs_dir / "ssh_stderr.log",
+            quantum_output["client"],
+            ground_truth["client"],
+        ),
     )
     t_cli.daemon = True
     t_cli.start()
@@ -353,12 +389,45 @@ def _capture_ssh_controlled(
         client.wait(timeout=60)
     except subprocess.TimeoutExpired:
         terminate(client, "ssh")
+    application_handle.close()
+    t_cli.join(timeout=1)
+    if client.returncode != 0:
+        terminate(server, "sshd")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError(f"SSH client failed with status {client.returncode}")
+    if application_output.stat().st_size != payload_bytes:
+        terminate(server, "sshd")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError(
+            f"SSH payload mismatch: got {application_output.stat().st_size}, "
+            f"expected {payload_bytes}"
+        )
 
     time.sleep(0.5)
     terminate(server, "sshd")
     stop_tshark(tshark, tshark_threads)
 
     return pcap_total_bytes(pcap_file)
+
+
+def _capture_quic_controlled(
+    openssl: Path,
+    payload_bytes: int,
+    port: int,
+    verbose: bool,
+    tmp_dir: Path,
+) -> int:
+    """Run one QUIC exchange with an exact response body size."""
+    capture_quic(
+        openssl,
+        "lo",
+        port,
+        "X25519",
+        tmp_dir,
+        verbose,
+        response_size=payload_bytes,
+    )
+    return pcap_total_bytes(tmp_dir / "pcap/quic.pcapng")
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +491,22 @@ def measure_ssh(sshd, ssh_bin, ssh_keygen, payload_sizes, port, verbose, tmp_roo
     return results
 
 
+def measure_quic(openssl, payload_sizes, port, verbose, tmp_root):
+    results = []
+    for payload in payload_sizes:
+        tmp = tmp_root / f"quic_x25519_{payload}"
+        tmp.mkdir(parents=True, exist_ok=True)
+        print(f"  QUIC X25519 payload={payload:>9,} B ...", end=" ", flush=True)
+        try:
+            total = _capture_quic_controlled(openssl, payload, port, verbose, tmp)
+            alpha = total / payload
+            results.append((payload, total, alpha))
+            print(f"total={total:>8,} B  α={alpha:.3f}")
+        except Exception as exc:
+            print(f"FAILED: {exc}")
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Plot
 # ---------------------------------------------------------------------------
@@ -464,6 +549,7 @@ def plot_validation(
     marker_map = {
         TLS12_RSA.label: ("o", TLS12_RSA.color),
         TLS13_1RTT.label: ("D", TLS13_1RTT.color),
+        QUIC_X25519.label: ("v", QUIC_X25519.color),
         SSH_X25519.label: ("^", SSH_X25519.color),
     }
     proto_by_label = {p.label: p for p in protocols}
@@ -564,6 +650,7 @@ def main():
     )
     parser.add_argument("--port", type=int, default=44443)
     parser.add_argument("--ssh-port", type=int, default=44444)
+    parser.add_argument("--quic-port", type=int, default=44445)
     parser.add_argument("--openssl", default=None, help="Path to openssl binary")
     parser.add_argument(
         "--openssh-dir", default=None, help="Path to OpenSSH install dir"
@@ -571,8 +658,8 @@ def main():
     parser.add_argument(
         "--protocols",
         nargs="+",
-        choices=["tls12_rsa", "tls13_1rtt", "ssh_x25519"],
-        default=["tls12_rsa", "tls13_1rtt", "ssh_x25519"],
+        choices=["tls12_rsa", "tls13_1rtt", "quic_x25519", "ssh_x25519"],
+        default=["tls12_rsa", "tls13_1rtt", "quic_x25519", "ssh_x25519"],
         help="Which protocols to measure (default: all)",
     )
     parser.add_argument(
@@ -615,13 +702,13 @@ def main():
 
     try:
         if "tls12_rsa" in args.protocols:
-            print("\n[1/3] TLS 1.2 RSA measurements")
+            print("\n[1/4] TLS 1.2 RSA measurements")
             empirical[TLS12_RSA.label] = measure_tls12_rsa(
                 openssl_path, payload_sizes, args.port, args.verbose, tmp_root
             )
 
         if "tls13_1rtt" in args.protocols:
-            print("\n[2/3] TLS 1.3 1-RTT measurements")
+            print("\n[2/4] TLS 1.3 1-RTT measurements")
             empirical[TLS13_1RTT.label] = measure_tls13_1rtt(
                 openssl_path, payload_sizes, args.port, args.verbose, tmp_root
             )
@@ -632,13 +719,23 @@ def main():
             ssh_keygen = openssh_dir / "bin/ssh-keygen"
             for b, n in [(sshd, "sshd"), (ssh_bin, "ssh"), (ssh_keygen, "ssh-keygen")]:
                 ensure_exec(b, n)
-            print("\n[3/3] SSH X25519 measurements")
+            print("\n[3/4] SSH X25519 measurements")
             empirical[SSH_X25519.label] = measure_ssh(
                 sshd,
                 ssh_bin,
                 ssh_keygen,
                 payload_sizes,
                 args.ssh_port,
+                args.verbose,
+                tmp_root,
+            )
+
+        if "quic_x25519" in args.protocols:
+            print("\n[4/4] QUIC X25519 measurements")
+            empirical[QUIC_X25519.label] = measure_quic(
+                openssl_path,
+                payload_sizes,
+                args.quic_port,
                 args.verbose,
                 tmp_root,
             )

@@ -18,9 +18,7 @@ from pathlib import Path
 from ..common import terminate, start_tshark, stop_tshark
 
 SSH_QUANTUM_RE = re.compile(r"SSH_QUANTUM_(\w+)=\s*([0-9a-fA-F]+)")
-SSH_GROUND_TRUTH_RE = re.compile(
-    r"SSH_GROUND_TRUTH_(\w+)=\s*([0-9a-fA-F]+)"
-)
+SSH_GROUND_TRUTH_RE = re.compile(r"SSH_GROUND_TRUTH_(\w+)=\s*([0-9a-fA-F]+)")
 
 
 def _sha256(path: Path) -> str:
@@ -149,11 +147,15 @@ def _quantum_recoveries(hook_output: dict) -> list[dict]:
     for record in hook_output.get("records", []):
         if record["name"] == "EPHEMERAL_PRIV":
             if pending_private is not None:
-                raise RuntimeError("quantum hook emitted two private values without a public value")
+                raise RuntimeError(
+                    "quantum hook emitted two private values without a public value"
+                )
             pending_private = record["value"]
         elif record["name"] == "EPHEMERAL_PUB":
             if pending_private is None:
-                raise RuntimeError("quantum hook emitted a public value without a private value")
+                raise RuntimeError(
+                    "quantum hook emitted a public value without a private value"
+                )
             recoveries.append(
                 {
                     "ephemeral_private": pending_private,
@@ -276,9 +278,7 @@ def capture_ssh(
     tshark_threads = None
     tshark_error = None
     try:
-        tshark, tshark_threads = start_tshark(
-            pcap_file, iface, port, logs_dir, verbose
-        )
+        tshark, tshark_threads = start_tshark(pcap_file, iface, port, logs_dir, verbose)
     except RuntimeError as exc:
         tshark_error = str(exc)
         print(f"[!] PCAP capture unavailable; retaining SSH wire streams: {exc}")
@@ -536,9 +536,7 @@ def capture_ssh(
             "repository_commit": git_commit,
             "repository_dirty": git_dirty,
         },
-        "binary_sha256": {
-            str(path): _sha256(path) for path in (ssh, sshd, ssh_keygen)
-        },
+        "binary_sha256": {str(path): _sha256(path) for path in (ssh, sshd, ssh_keygen)},
         "implementation_sha256": {
             str(path.relative_to(repo_root)): _sha256(path)
             for path in implementation_paths

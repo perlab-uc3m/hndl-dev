@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_DIR="/opt/openssl3_local"
+# Resolve script and repository roots before selecting the default prefix.  A
+# repository-local installation is what capture/capture.py expects and avoids
+# requiring root merely to build the research artifact.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(readlink -f "${SCRIPT_DIR}/..")"
+INSTALL_DIR="${REPO_ROOT}/openssl"
 SRC_DIR="${INSTALL_DIR}/src"
 OPENSSL_TAG="openssl-3.6.0"
 JOBS="$(nproc)"
@@ -11,9 +16,6 @@ DO_INSTALL=0
 VERBOSE=0
 PATCH_FILE=""
 
-# Resolve script and repo roots to locate default patch file reliably
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(readlink -f "${SCRIPT_DIR}/..")"
 DEFAULT_PATCH="${REPO_ROOT}/patches/openssl-3.6.0-tls13-debug.patch"
 
 usage() {
@@ -69,13 +71,15 @@ echov() { if [ "${VERBOSE:-0}" -eq 1 ]; then echo "$@"; fi }
 clone_repo() {
   if [ -d "$SRC_DIR/openssl/.git" ]; then
     echo "OpenSSL source already present at $SRC_DIR/openssl"
-    # Even if already present, try to apply patch if provided
     if [ -f "$PATCH_FILE" ]; then
-      echo "Attempting to apply patch to existing source: $PATCH_FILE"
       if git -C "$SRC_DIR/openssl" apply --check "$PATCH_FILE"; then
-        git -C "$SRC_DIR/openssl" apply "$PATCH_FILE" && echo "Patch applied successfully to existing source."
+        git -C "$SRC_DIR/openssl" apply "$PATCH_FILE"
+        echo "Patch applied successfully to existing source."
+      elif git -C "$SRC_DIR/openssl" apply --reverse --check "$PATCH_FILE"; then
+        echo "Patch is already applied."
       else
-        echo "Patch could not be cleanly applied (it may already be applied or conflicts with current source)."
+        echo "Patch conflicts with the existing source: $PATCH_FILE" >&2
+        exit 1
       fi
     else
       echo "No patch applied (patch file not found at $PATCH_FILE)."
@@ -88,7 +92,7 @@ clone_repo() {
   if [ -f "$PATCH_FILE" ]; then
     echo "Found patch file: $PATCH_FILE"
     echo "Checking patch applicability..."
-    git -C "$SRC_DIR/openssl" apply --check "$PATCH_FILE" || { echo "Patch check failed; aborting."; exit 1; }
+    git -C "$SRC_DIR/openssl" apply --check "$PATCH_FILE" || { echo "Patch check failed; aborting." >&2; exit 1; }
     git -C "$SRC_DIR/openssl" apply "$PATCH_FILE" || { echo "Patch application failed; aborting."; exit 1; }
     echo "Patch applied successfully."
   else

@@ -5,7 +5,6 @@ import binascii
 import hashlib
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
@@ -13,23 +12,15 @@ from cryptography.hazmat.primitives import serialization
 from ..core import (
     derive_tls13_keys_with_trace,
     compute_shared_secret_from_priv_and_peer,
-    hkdf_expand_label,
-    get_hash_algo,
     nss_tls13_key_log_line,
     parse_tls13_handshake_secrets_from_keylog,
     print_secret_comparison,
-    sha_hex,
     compute_th_finished,
 )
 from ..io import (
     CapturePaths,
-    load_ephemeral_keys,
-    save_diagnostics,
+    load_simulated_recovery,
     save_key_schedule_trace,
-    save_transcript_hashes,
-    save_handshake_messages,
-    load_th_finished,
-    save_th_finished,
     find_first_frame,
     hexdump_frame,
     extract_first_handshake_message,
@@ -42,6 +33,7 @@ from ..io import (
     parse_client_keyshare_pub_from_ch,
     parse_server_keyshare_pub_from_sh,
     extract_decrypted_handshake_from_tshark,
+    verify_tls_http_request,
 )
 
 
@@ -103,24 +95,6 @@ def _extract_hello_messages(paths: CapturePaths, port: int, debug: bool):
     return ch, sh
 
 
-def _select_ephemeral_keys(server_e: dict, client_e: dict, role: str, debug: bool):
-    """Select which ephemeral keys to use based on role."""
-    if role in ("auto", "server"):
-        priv_hex = server_e.get("priv")
-        peer_pub_hex = client_e.get("pub")
-        if not priv_hex and client_e.get("priv") and server_e.get("pub"):
-            priv_hex = client_e.get("priv")
-            peer_pub_hex = server_e.get("pub")
-    else:
-        priv_hex = client_e.get("priv")
-        peer_pub_hex = server_e.get("pub")
-        if not priv_hex and server_e.get("priv") and client_e.get("pub"):
-            priv_hex = server_e.get("priv")
-            peer_pub_hex = client_e.get("pub")
-
-    return priv_hex, peer_pub_hex
-
-
 def _compute_th_finished(
     pcap_file: Path,
     keylog_file: Path,
@@ -161,12 +135,12 @@ def derive_1rtt(
     if not paths.pcap_exists():
         return {"success": False, "error": f"PCAP not found: {paths.pcap}"}
 
-    # Load ephemeral keys
-    server_e, client_e = load_ephemeral_keys(paths.capture_dir)
-    priv_hex, peer_pub_hex = _select_ephemeral_keys(server_e, client_e, role, debug)
-
-    if not priv_hex or not peer_pub_hex:
-        return {"success": False, "error": "Missing ephemeral keys"}
+    try:
+        recovery = load_simulated_recovery(paths.capture_dir)
+    except (OSError, ValueError) as exc:
+        return {"success": False, "error": str(exc)}
+    if recovery["group"].lower() != "x25519" or curve.lower() != "x25519":
+        return {"success": False, "error": "Only X25519 recovery is supported"}
 
     # Extract CH/SH
     ch, sh = _extract_hello_messages(paths, port, debug)
@@ -187,30 +161,27 @@ def derive_1rtt(
     try:
         ch_pub = parse_client_keyshare_pub_from_ch(ch)
         sh_pub = parse_server_keyshare_pub_from_sh(sh)
-    except Exception:
-        ch_pub = sh_pub = None
-
-    # Compute shared secret Z
-    if ch_pub and server_e.get("priv"):
+        if not ch_pub or not sh_pub:
+            raise ValueError("X25519 KeyShare missing from captured hello")
+        private_hex = recovery["ephemeral_private"]
+        recovered_public = _x25519_pub_from_priv(private_hex)
+        declared_public = bytes.fromhex(recovery["ephemeral_public_check"])
+        if recovered_public != declared_public:
+            raise ValueError("recovered private value does not match its public check")
+        if recovery["role"] == "server":
+            own_public, peer_public = sh_pub, ch_pub
+        else:
+            own_public, peer_public = ch_pub, sh_pub
+        if recovered_public != own_public:
+            raise ValueError("recovered value does not match the captured KeyShare")
         Z = compute_shared_secret_from_priv_and_peer(
-            server_e["priv"], binascii.hexlify(ch_pub).decode(), curve
+            private_hex, peer_public.hex(), curve
         )
-    elif sh_pub and client_e.get("priv"):
-        Z = compute_shared_secret_from_priv_and_peer(
-            client_e["priv"], binascii.hexlify(sh_pub).decode(), curve
-        )
-    else:
-        Z = compute_shared_secret_from_priv_and_peer(priv_hex, peer_pub_hex, curve)
+    except (ValueError, TypeError, binascii.Error) as exc:
+        return {"success": False, "error": f"Invalid recovery input: {exc}"}
 
     # Compute th_hello
     th_hello = hashlib.new(tls_hash, ch + sh).digest()
-
-    # Load OpenSSL keylog for verification
-    keylog_truth = {}
-    if paths.openssl_keylog_exists():
-        keylog_truth = parse_tls13_handshake_secrets_from_keylog(
-            paths.openssl_keylog, client_random
-        )
 
     # Derive handshake secrets
     derived_hs, trace_hs, derived_hs_hex = derive_tls13_keys_with_trace(
@@ -220,7 +191,7 @@ def derive_1rtt(
     paths.ensure_derived_dir()
 
     # Write handshake-only keylog for decrypting rest of handshake
-    tmp_keylog = Path(tempfile.gettempdir()) / "tls13_handshake.keylog"
+    tmp_keylog = paths.handshake_only_keylog
     with tmp_keylog.open("w") as f:
         f.write(
             nss_tls13_key_log_line(
@@ -301,7 +272,13 @@ def derive_1rtt(
             )
         )
 
-    # Verify against OpenSSL keylog
+    # Verification is deliberately last: endpoint key logs never supply an
+    # attack input or intermediate value.
+    keylog_truth = {}
+    if paths.openssl_keylog_exists():
+        keylog_truth = parse_tls13_handshake_secrets_from_keylog(
+            paths.openssl_keylog, client_random
+        )
     derived_map = {
         "CLIENT_HANDSHAKE_TRAFFIC_SECRET": derived_hex[
             "client_handshake_traffic_secret"
@@ -315,16 +292,25 @@ def derive_1rtt(
     ok, total = print_secret_comparison(
         "TLS 1.3", keylog_truth, derived_map, verbose=debug
     )
+    plaintext_ok = verify_tls_http_request(
+        paths.pcap, paths.nss_derived_keylog, port, debug
+    )
 
     # Save trace
     save_key_schedule_trace(paths.derived_dir, trace, "key_schedule_trace.json", debug)
 
     status = "ALL MATCH" if ok == total else f"{ok}/{total} MATCH"
     print(f"TLS 1.3 keys: {status} ({total} secrets)")
+    print(f"TLS 1.3 plaintext: {'RECOVERED' if plaintext_ok else 'NOT VERIFIED'}")
     print(f"Output: {paths.nss_derived_keylog}")
 
     return {
-        "success": ok == total,
+        "success": ok == total and total == 4 and plaintext_ok,
         "keylog_path": str(paths.nss_derived_keylog),
         "secrets": derived_hex,
+        "validation": {
+            "ground_truth_matches": ok,
+            "ground_truth_expected": 4,
+            "application_plaintext_recovered": plaintext_ok,
+        },
     }

@@ -95,6 +95,23 @@ def get_keylog_path(capture_dir: Path, protocol: str, mode: str) -> Path:
         return capture_dir / "derived/nss_derived.keylog"
 
 
+def get_pcap_paths(capture_dir: Path, protocol: str, mode: str) -> list[Path]:
+    """Return the capture files produced by a protocol/mode."""
+    if protocol == "tls13" and mode == "0rtt":
+        return [
+            capture_dir / "pcap/tls13_0rtt_phase1_initial.pcapng",
+            capture_dir / "pcap/tls13_0rtt_phase2_resumption.pcapng",
+        ]
+    names = {
+        ("tls13", "1rtt"): "tls13_1rtt.pcapng",
+        ("tls12", "rsa"): "tls12_rsa.pcapng",
+        ("quic", None): "quic.pcapng",
+        ("ssh", None): "ssh_session.pcapng",
+    }
+    name = names.get((protocol, mode)) or names.get((protocol, None))
+    return [capture_dir / "pcap" / name] if name else []
+
+
 def main():
     parser = argparse.ArgumentParser(description="HN-DL Attack Simulation")
     parser.add_argument(
@@ -159,9 +176,14 @@ def main():
     if success:
         keylog = get_keylog_path(capture_dir, args.protocol, args.mode)
         print(f"Keylog:  {keylog}")
-        pcap = capture_dir / "pcap" / f"{args.protocol}_session.pcapng"
-        if pcap.exists() and pcap.stat().st_size:
-            print(f"PCAP:    {pcap}")
+        pcaps = [
+            p
+            for p in get_pcap_paths(capture_dir, args.protocol, args.mode)
+            if p.exists() and p.stat().st_size
+        ]
+        if pcaps:
+            for pcap in pcaps:
+                print(f"PCAP:    {pcap}")
         elif args.protocol == "ssh":
             print(f"Archive: {capture_dir}/pcap/ssh_*_to_*.bin")
         else:

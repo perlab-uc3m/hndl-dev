@@ -31,13 +31,13 @@ sys.path.insert(0, str(REPO_ROOT))
 from capture.common import (
     ensure_exec,
     check_tool,
-    tcp_port_open,
     generate_cert_key,
     start_tshark,
     stop_tshark,
     reader_thread,
     terminate,
 )
+from decryptor.io import run_tshark
 
 # ---------------------------------------------------------------------------
 # Plot style
@@ -111,14 +111,16 @@ def pcap_total_bytes(pcap_path: Path, skip_pure_acks: bool = True) -> int:
         "-e",
         "tcp.len",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_tshark(cmd, pcap_path)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or "tshark failed while measuring PCAP")
     total = 0
     for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 2:
+        parts = line.split("\t")
+        if not parts or not parts[0].strip().isdigit():
             continue
-        frame_len = int(parts[0])
-        tcp_len_str = parts[1]
+        frame_len = int(parts[0].strip())
+        tcp_len_str = parts[1].strip() if len(parts) > 1 else ""
         if skip_pure_acks and tcp_len_str.isdigit() and int(tcp_len_str) == 0:
             continue
         total += frame_len
@@ -140,9 +142,33 @@ def count_client_hellos(pcap_path: Path, keylog_path: Path) -> int:
         "-e",
         "frame.number",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_tshark(cmd, pcap_path, (keylog_path,))
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or "tshark failed while counting ClientHello")
     lines = result.stdout.strip().splitlines() if result.stdout.strip() else []
     return len(lines)
+
+
+def count_handshakes_with_extension(
+    pcap_path: Path, handshake_type: int, extension_type: int
+) -> int:
+    """Count hello messages carrying one named extension."""
+    cmd = [
+        "tshark",
+        "-r",
+        str(pcap_path),
+        "-Y",
+        f"tls.handshake.type=={handshake_type} && "
+        f"tls.handshake.extension.type=={extension_type}",
+        "-T",
+        "fields",
+        "-e",
+        "frame.number",
+    ]
+    result = run_tshark(cmd, pcap_path)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or "tshark failed while checking handshake")
+    return len([line for line in result.stdout.splitlines() if line.strip()])
 
 
 # ---------------------------------------------------------------------------
@@ -227,10 +253,14 @@ def measure_handshake_overhead(
 
     for _ in range(50):
         if server.poll() is not None:
-            sys.exit("TLS server exited prematurely")
-        if server_accept_event.is_set() or tcp_port_open("127.0.0.1", port):
+            terminate(server, "server")
+            raise RuntimeError("TLS server exited before becoming ready")
+        if server_accept_event.is_set():
             break
         time.sleep(0.1)
+    if not server_accept_event.is_set():
+        terminate(server, "server")
+        raise RuntimeError("TLS server did not report readiness")
 
     sess_file = sess_dir / "session.pem"
 
@@ -282,6 +312,16 @@ def measure_handshake_overhead(
     stop_tshark(tshark_resum, tshark_resum_threads)
 
     resum_total = pcap_total_bytes(pcap_resum)
+
+    resumed_psk = count_handshakes_with_extension(pcap_resum, 1, 41)
+    resumed_dhe = count_handshakes_with_extension(pcap_resum, 2, 51)
+    if resumed_psk != n_resumptions or resumed_dhe != n_resumptions:
+        terminate(server, "server")
+        raise RuntimeError(
+            "resumption validation failed: "
+            f"PSK ClientHellos={resumed_psk}, DHE ServerHellos={resumed_dhe}, "
+            f"expected={n_resumptions}"
+        )
 
     terminate(server, "server")
 
@@ -360,6 +400,12 @@ def _do_connection(
         client.wait(timeout=10)
     except subprocess.TimeoutExpired:
         terminate(client, f"s_client[{label}]")
+    t_co.join(timeout=1)
+    t_ce.join(timeout=1)
+    if client.returncode != 0:
+        raise RuntimeError(f"s_client[{label}] failed with status {client.returncode}")
+    if sess_out and (not sess_out.exists() or sess_out.stat().st_size == 0):
+        raise RuntimeError(f"s_client[{label}] did not save a session ticket")
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +424,7 @@ def _do_data_connection(
     sess_out: Path | None,
     label: str,
     verbose: bool,
+    expected_bytes: int,
 ):
     """One s_client connection: TLS 1.3 handshake + fetch a file via -WWW + close."""
     client_cmd = [
@@ -436,6 +483,15 @@ def _do_data_connection(
         client.wait(timeout=60)
     except subprocess.TimeoutExpired:
         terminate(client, f"s_client[{label}]")
+    t_co.join(timeout=1)
+    t_ce.join(timeout=1)
+    if client.returncode != 0:
+        raise RuntimeError(f"s_client[{label}] failed with status {client.returncode}")
+    response_path = logs_dir / f"cli_out_{label}.log"
+    if not response_path.exists() or response_path.stat().st_size < expected_bytes:
+        raise RuntimeError(f"s_client[{label}] received an incomplete response")
+    if sess_out and (not sess_out.exists() or sess_out.stat().st_size == 0):
+        raise RuntimeError(f"s_client[{label}] did not save a session ticket")
 
 
 def capture_rotated_transfer(
@@ -459,11 +515,6 @@ def capture_rotated_transfer(
     www_dir = tmp_dir / "www"
     for d in (keys_dir, logs_dir, pcap_dir, sess_dir, www_dir):
         d.mkdir(parents=True, exist_ok=True)
-
-    # Create data file of size R
-    data_file = www_dir / "data.bin"
-    with open(data_file, "wb") as f:
-        f.write(b"\x00" * rotation_bytes)
 
     cert_pem = keys_dir / "cert.pem"
     key_pem = keys_dir / "key.pem"
@@ -522,10 +573,14 @@ def capture_rotated_transfer(
 
     for _ in range(50):
         if server.poll() is not None:
-            sys.exit("TLS server exited prematurely")
-        if server_accept_event.is_set() or tcp_port_open("127.0.0.1", port):
+            terminate(server, "server")
+            raise RuntimeError("TLS server exited before becoming ready")
+        if server_accept_event.is_set():
             break
         time.sleep(0.1)
+    if not server_accept_event.is_set():
+        terminate(server, "server")
+        raise RuntimeError("TLS server did not report readiness")
     time.sleep(0.3)
 
     tshark, tshark_threads = start_tshark(pcap_file, "lo", port, logs_dir, verbose)
@@ -533,6 +588,9 @@ def capture_rotated_transfer(
 
     sess_file = None
     for i in range(E_expected):
+        chunk_bytes = min(rotation_bytes, payload_bytes - i * rotation_bytes)
+        filename = f"data_{i}.bin"
+        (www_dir / filename).write_bytes(b"\x00" * chunk_bytes)
         sess_out = sess_dir / f"session_{i}.pem"
         _do_data_connection(
             openssl,
@@ -540,11 +598,12 @@ def capture_rotated_transfer(
             keylog_file,
             base_env,
             logs_dir,
-            filename="data.bin",
+            filename=filename,
             sess_in=sess_file,
             sess_out=sess_out,
             label=f"rot-{i}",
             verbose=verbose,
+            expected_bytes=chunk_bytes,
         )
         sess_file = sess_out
         time.sleep(0.3)
@@ -555,6 +614,13 @@ def capture_rotated_transfer(
 
     total_bytes = pcap_total_bytes(pcap_file)
     E_measured = count_client_hellos(pcap_file, keylog_file)
+    psk_resumptions = count_handshakes_with_extension(pcap_file, 1, 41)
+    dhe_handshakes = count_handshakes_with_extension(pcap_file, 2, 51)
+    if psk_resumptions != max(0, E_expected - 1) or dhe_handshakes != E_expected:
+        raise RuntimeError(
+            "rotation was not an initial handshake followed by PSK-DHE: "
+            f"PSK resumptions={psk_resumptions}, DHE handshakes={dhe_handshakes}"
+        )
 
     return total_bytes, E_measured
 

@@ -10,7 +10,6 @@ import csv
 import os
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 import matplotlib
@@ -18,7 +17,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-import matplotlib.ticker as mticker
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -413,9 +411,9 @@ def compute_summary_table(padding_data, rekey_data, psk_data):
     rows.append(
         {
             "mitigation": "Disable TLS 1.3 0-RTT",
-            "axis": "Cascade",
+            "axis": "Early data",
             "parameter": "---",
-            "inflation": "PSK chain eliminated",
+            "inflation": "PSK-derived 0-RTT exposure eliminated",
             "overhead": "+1 RTT",
         }
     )

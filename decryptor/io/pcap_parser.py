@@ -3,11 +3,53 @@
 
 import binascii
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
 RECORD_HANDSHAKE = 0x16
+
+
+def run_tshark(
+    command: list[str],
+    pcap_file: Path,
+    auxiliary_files: tuple[Path, ...] = (),
+) -> subprocess.CompletedProcess:
+    """Run tshark, staging inputs only when its AppArmor profile blocks them.
+
+    Ubuntu's tshark AppArmor profile can permit dumpcap to create a PCAP under
+    a home directory while denying tshark permission to reopen that same file.
+    A retry from a private temporary directory preserves the original evidence
+    and avoids weakening the host policy.  The fallback is intentionally used
+    only for an explicit permission error.
+    """
+    result = subprocess.run(command, capture_output=True, text=True)
+    permission_error = result.returncode != 0 and any(
+        marker in result.stderr.lower()
+        for marker in ("permission to read", "permission denied")
+    )
+    if not permission_error:
+        return result
+
+    sources = (Path(pcap_file), *(Path(path) for path in auxiliary_files))
+    with tempfile.TemporaryDirectory(prefix="hndl-tshark-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        replacements = {}
+        for index, source in enumerate(sources):
+            staged = temp_dir / f"{index}-{source.name}"
+            shutil.copyfile(source, staged)
+            staged.chmod(0o600)
+            replacements[str(source)] = str(staged)
+        retry_command = [_replace_paths(argument, replacements) for argument in command]
+        return subprocess.run(retry_command, capture_output=True, text=True)
+
+
+def _replace_paths(argument: str, replacements: dict[str, str]) -> str:
+    for original, staged in replacements.items():
+        argument = argument.replace(original, staged)
+    return argument
 
 
 def hexdump_frame(pcap: Path, frame_no: int, port: int) -> bytes:
@@ -26,7 +68,7 @@ def hexdump_frame(pcap: Path, frame_no: int, port: int) -> bytes:
         f"frame.number=={frame_no}",
         "-x",
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = run_tshark(cmd, pcap)
     if p.returncode != 0:
         raise RuntimeError(p.stderr or "tshark -x failed")
     hex_bytes = []
@@ -68,7 +110,7 @@ def find_first_frame(pcap: Path, display_filter: str, port: int) -> int:
         "-e",
         "frame.number",
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = run_tshark(cmd, pcap)
     if p.returncode != 0:
         return 0
     for line in p.stdout.splitlines():
@@ -97,7 +139,7 @@ def iter_tcp_payloads(pcap: Path, port: int):
         "-e",
         "tcp.payload",
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = run_tshark(cmd, pcap)
     if p.returncode != 0:
         return
     for line in p.stdout.splitlines():
@@ -156,7 +198,7 @@ def get_first_tcp_stream_index(pcap: Path, port: int) -> int:
         "-e",
         "tcp.stream",
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = run_tshark(cmd, pcap)
     if p.returncode != 0:
         return -1
     for line in p.stdout.splitlines():
@@ -180,7 +222,7 @@ def list_tcp_stream_indices(pcap: Path, port: int | None = None) -> list[int]:
         "-e",
         "tcp.stream",
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = run_tshark(cmd, pcap)
     if p.returncode != 0:
         return []
     seen = set()
@@ -234,7 +276,7 @@ def get_tcp_stream_bytes(pcap: Path, stream_index: int) -> tuple[bytes, bytes]:
         f"follow,tcp,raw,{stream_index}",
         "-P",
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = run_tshark(cmd, pcap)
     if p.returncode != 0 or not p.stdout:
         raise RuntimeError(p.stderr or "follow,tcp,raw failed")
     return parse_follow_tcp_raw_output(p.stdout)
@@ -521,7 +563,7 @@ def extract_decrypted_handshake_from_tshark(
     if debug:
         print(f"[dbg] Running: {' '.join(cmd)}")
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_tshark(cmd, pcap_file, (keylog_file,))
 
     if result.returncode != 0:
         if debug:
@@ -564,9 +606,23 @@ def extract_decrypted_handshake_from_tshark(
         except ValueError:
             pass
 
-    if debug and decrypted_messages:
-        print(f"[dbg] Extracted {len(decrypted_messages)} decrypted handshake messages")
-        for msg in decrypted_messages:
+    # A decrypted TLS record may contain several handshake messages followed
+    # by the TLSInnerPlaintext content-type byte.  Return protocol messages,
+    # rather than treating the entire record as one message.
+    parsed_messages = []
+    for plaintext in decrypted_messages:
+        offset = 0
+        while offset + 4 <= len(plaintext):
+            msg_len = int.from_bytes(plaintext[offset + 1 : offset + 4], "big")
+            total = 4 + msg_len
+            if total < 4 or offset + total > len(plaintext):
+                break
+            parsed_messages.append(plaintext[offset : offset + total])
+            offset += total
+
+    if debug and parsed_messages:
+        print(f"[dbg] Extracted {len(parsed_messages)} decrypted handshake messages")
+        for msg in parsed_messages:
             if len(msg) >= 4:
                 msg_type = msg[0]
                 type_names = {
@@ -579,4 +635,78 @@ def extract_decrypted_handshake_from_tshark(
                 type_name = type_names.get(msg_type, f"Type{msg_type}")
                 print(f"[dbg]   {type_name} ({msg_type}): {len(msg)} bytes")
 
-    return decrypted_messages
+    return parsed_messages
+
+
+def verify_tls_http_request(
+    pcap_file: Path, keylog_file: Path, port: int, debug: bool = False
+) -> bool:
+    """Prove that derived TLS secrets expose the captured HTTP request."""
+    cmd = [
+        "tshark",
+        "-r",
+        str(pcap_file),
+        "-o",
+        f"tls.keylog_file:{keylog_file}",
+        "-d",
+        f"tcp.port=={port},tls",
+        "-T",
+        "fields",
+        "-e",
+        "http.request.method",
+        "-e",
+        "http.request.uri",
+        "-e",
+        "tls.segment.data",
+    ]
+    result = run_tshark(cmd, pcap_file, (keylog_file,))
+    if debug and result.returncode != 0:
+        print(f"[dbg] tshark application-data validation failed: {result.stderr}")
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if fields and fields[0].strip() == "GET":
+            return True
+        for value in fields[2:]:
+            try:
+                plaintext = bytes.fromhex(value.replace(":", "").replace(",", ""))
+            except ValueError:
+                continue
+            if b"GET / HTTP/1.0" in plaintext:
+                return True
+    return False
+
+
+def verify_quic_stream_data(
+    pcap_file: Path, keylog_file: Path, port: int, debug: bool = False
+) -> bool:
+    """Prove that derived QUIC secrets expose known application stream data."""
+    cmd = [
+        "tshark",
+        "-r",
+        str(pcap_file),
+        "-o",
+        f"tls.keylog_file:{keylog_file}",
+        "-d",
+        f"udp.port=={port},quic",
+        "-Y",
+        "quic.stream_data",
+        "-T",
+        "fields",
+        "-e",
+        "quic.stream_data",
+    ]
+    result = run_tshark(cmd, pcap_file, (keylog_file,))
+    if debug and result.returncode != 0:
+        print(f"[dbg] tshark QUIC application-data validation failed: {result.stderr}")
+    if result.returncode != 0:
+        return False
+    decoded = bytearray()
+    for line in result.stdout.splitlines():
+        for value in line.split(","):
+            try:
+                decoded.extend(bytes.fromhex(value.replace(":", "").strip()))
+            except ValueError:
+                continue
+    return b"GET / HTTP/1.0" in decoded or b"A" * 32 in decoded

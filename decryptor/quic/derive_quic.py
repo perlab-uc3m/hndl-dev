@@ -12,15 +12,14 @@ import binascii
 import hashlib
 import hmac
 import shutil
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives import serialization
 
 from ..core import (
     derive_tls13_keys_with_trace,
@@ -32,12 +31,14 @@ from ..core import (
 )
 from ..io import (
     CapturePaths,
-    load_ephemeral_keys,
+    load_simulated_recovery,
     save_key_schedule_trace,
     parse_client_random_from_ch,
     parse_cipher_from_server_hello,
     parse_client_keyshare_pub_from_ch,
     parse_server_keyshare_pub_from_sh,
+    verify_quic_stream_data,
+    run_tshark,
 )
 
 
@@ -84,9 +85,13 @@ def _quic_initial_keys(dcid: bytes, is_server: bool):
 
 def _decode_varint(data: bytes):
     """Decode a QUIC variable-length integer. Returns (value, bytes_consumed)."""
+    if not data:
+        raise ValueError("truncated QUIC variable-length integer")
     first = data[0]
     prefix = first >> 6
     length = 1 << prefix
+    if len(data) < length:
+        raise ValueError("truncated QUIC variable-length integer")
     val = first & 0x3F
     for i in range(1, length):
         val = (val << 8) | data[i]
@@ -113,7 +118,9 @@ def _decrypt_quic_initial(
         return None
 
     offset = 1
-    # version = int.from_bytes(raw[offset:offset+4], "big")
+    version = int.from_bytes(raw[offset : offset + 4], "big")
+    if version != 1:
+        return None
     offset += 4
     dcid_len = raw[offset]
     offset += 1
@@ -124,11 +131,17 @@ def _decrypt_quic_initial(
     offset += scid_len
 
     # Token (variable-length)
-    token_len, consumed = _decode_varint(raw[offset:])
+    try:
+        token_len, consumed = _decode_varint(raw[offset:])
+    except ValueError:
+        return None
     offset += consumed + token_len
 
     # Payload length (variable-length)
-    pkt_payload_len, consumed = _decode_varint(raw[offset:])
+    try:
+        pkt_payload_len, consumed = _decode_varint(raw[offset:])
+    except ValueError:
+        return None
     offset += consumed
 
     # offset now points to the (protected) packet number
@@ -191,17 +204,28 @@ def _parse_crypto_frames(plaintext: bytes):
     crypto_data = []
     i = 0
     while i < len(plaintext):
-        frame_type_val, consumed = _decode_varint(plaintext[i:])
+        try:
+            frame_type_val, consumed = _decode_varint(plaintext[i:])
+        except ValueError:
+            break
         i += consumed
         if frame_type_val == 0x00:
             # PADDING — single zero byte, already consumed
             continue
         elif frame_type_val == 0x06:
             # CRYPTO frame: offset(var) + length(var) + data
-            crypto_offset, c = _decode_varint(plaintext[i:])
+            try:
+                crypto_offset, c = _decode_varint(plaintext[i:])
+            except ValueError:
+                break
             i += c
-            crypto_len, c = _decode_varint(plaintext[i:])
+            try:
+                crypto_len, c = _decode_varint(plaintext[i:])
+            except ValueError:
+                break
             i += c
+            if i + crypto_len > len(plaintext):
+                break
             crypto_data.append((crypto_offset, plaintext[i : i + crypto_len]))
             i += crypto_len
         elif frame_type_val == 0x02 or frame_type_val == 0x03:
@@ -252,6 +276,19 @@ def _parse_handshake_from_crypto(data: bytes):
     return data[:total]
 
 
+def _reassemble_crypto_prefix(segments: dict[int, bytes]) -> bytes:
+    """Return the contiguous CRYPTO stream prefix beginning at offset zero."""
+    out = bytearray()
+    for offset in sorted(segments):
+        data = segments[offset]
+        if offset > len(out):
+            break
+        overlap = len(out) - offset
+        if overlap < len(data):
+            out.extend(data[overlap:])
+    return bytes(out)
+
+
 def _iter_coalesced_packets(datagram: bytes):
     """Yield individual QUIC packets from a potentially coalesced datagram."""
     offset = 0
@@ -284,7 +321,11 @@ def _iter_coalesced_packets(datagram: bytes):
                 if pos >= len(datagram):
                     yield datagram[offset:]
                     break
-                token_len, c = _decode_varint(datagram[pos:])
+                try:
+                    token_len, c = _decode_varint(datagram[pos:])
+                except ValueError:
+                    yield datagram[offset:]
+                    break
                 pos += c + token_len
             elif pkt_type == 3:  # Retry — no length, rest is the packet
                 yield datagram[offset:]
@@ -293,7 +334,11 @@ def _iter_coalesced_packets(datagram: bytes):
             if pos >= len(datagram):
                 yield datagram[offset:]
                 break
-            pkt_payload_len, c = _decode_varint(datagram[pos:])
+            try:
+                pkt_payload_len, c = _decode_varint(datagram[pos:])
+            except ValueError:
+                yield datagram[offset:]
+                break
             pos += c
             total_len = pos - offset + pkt_payload_len
             yield datagram[offset : offset + total_len]
@@ -322,13 +367,15 @@ def _extract_quic_crypto_data(pcap: Path, port: int, debug: bool = False):
     ]
     if debug:
         print(f"[dbg] Running: {' '.join(cmd)}")
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = run_tshark(cmd, pcap)
     if p.returncode != 0:
         if debug:
             print(f"[dbg] tshark error: {p.stderr}")
         return None, None
 
     ch = sh = None
+    client_crypto: dict[int, bytes] = {}
+    server_crypto: dict[int, bytes] = {}
     # Track the DCID used for Initial key derivation.
     # After a Retry the DCID changes and Initial keys are re-derived.
     initial_dcid = None  # the DCID from the *latest* client Initial
@@ -357,6 +404,8 @@ def _extract_quic_crypto_data(pcap: Path, port: int, debug: bool = False):
             first = pkt[0]
             if not (first & 0x80):
                 continue  # Short header → skip
+            if int.from_bytes(pkt[1:5], "big") != 1:
+                continue
 
             pkt_type = (first >> 4) & 0x03
 
@@ -397,21 +446,32 @@ def _extract_quic_crypto_data(pcap: Path, port: int, debug: bool = False):
                 continue
 
             # Extract CRYPTO frames
-            for _, crypto_bytes in _parse_crypto_frames(plaintext):
-                msg = _parse_handshake_from_crypto(crypto_bytes)
-                if msg is None:
-                    continue
-                hs_type = msg[0]
-                if hs_type == 1 and ch is None:
+            target = client_crypto if is_to_server else server_crypto
+            try:
+                crypto_frames = _parse_crypto_frames(plaintext)
+            except ValueError:
+                continue
+            for crypto_offset, crypto_bytes in crypto_frames:
+                target.setdefault(crypto_offset, crypto_bytes)
+
+            if ch is None:
+                msg = _parse_handshake_from_crypto(
+                    _reassemble_crypto_prefix(client_crypto)
+                )
+                if msg is not None and msg[0] == 1:
                     ch = msg
                     if debug:
                         print(f"[dbg] Extracted ClientHello: {len(ch)} bytes")
-                elif hs_type == 2 and sh is None:
+            if sh is None:
+                msg = _parse_handshake_from_crypto(
+                    _reassemble_crypto_prefix(server_crypto)
+                )
+                if msg is not None and msg[0] == 2:
                     sh = msg
                     if debug:
                         print(f"[dbg] Extracted ServerHello: {len(sh)} bytes")
-                if ch and sh:
-                    return ch, sh
+            if ch and sh:
+                return ch, sh
 
     return ch, sh
 
@@ -458,6 +518,8 @@ def _decrypt_quic_handshake_pkt(
         return None
 
     offset = 1
+    if int.from_bytes(raw[offset : offset + 4], "big") != 1:
+        return None
     offset += 4  # version
     dcid_len = raw[offset]
     offset += 1
@@ -467,7 +529,10 @@ def _decrypt_quic_handshake_pkt(
     offset += scid_len
 
     # Payload length (variable-length integer) — no token in Handshake
-    pkt_payload_len, consumed = _decode_varint(raw[offset:])
+    try:
+        pkt_payload_len, consumed = _decode_varint(raw[offset:])
+    except ValueError:
+        return None
     offset += consumed
 
     pn_offset = offset
@@ -542,7 +607,7 @@ def _extract_quic_decrypted_handshake(
         "-e",
         "udp.dstport",
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = run_tshark(cmd, pcap_file)
     if p.returncode != 0:
         return []
 
@@ -586,7 +651,11 @@ def _extract_quic_decrypted_handshake(
                     f"[dbg] Decrypted QUIC Handshake pkt " f"({len(plaintext)} bytes)"
                 )
 
-            for crypto_offset, crypto_bytes in _parse_crypto_frames(plaintext):
+            try:
+                crypto_frames = _parse_crypto_frames(plaintext)
+            except ValueError:
+                continue
+            for crypto_offset, crypto_bytes in crypto_frames:
                 crypto_segments[crypto_offset] = crypto_bytes
 
     if not crypto_segments:
@@ -662,18 +731,12 @@ def derive_quic(
     if not paths.pcap_exists():
         return {"success": False, "error": f"PCAP not found: {paths.pcap}"}
 
-    # Load ephemeral keys
-    server_e, client_e = load_ephemeral_keys(paths.capture_dir)
-
-    # For QUIC, client ephemeral is always available from s_client stderr
-    priv_hex = client_e.get("priv")
-    if not priv_hex and server_e.get("priv"):
-        priv_hex = server_e.get("priv")
-        if debug:
-            print("[dbg] Using server ephemeral private key (fallback)")
-
-    if not priv_hex:
-        return {"success": False, "error": "No ephemeral private key found"}
+    try:
+        recovery = load_simulated_recovery(paths.capture_dir)
+    except (OSError, ValueError) as exc:
+        return {"success": False, "error": str(exc)}
+    if recovery["group"].lower() != "x25519" or curve.lower() != "x25519":
+        return {"success": False, "error": "Only X25519 recovery is supported"}
 
     # Extract CH/SH from QUIC CRYPTO frames
     ch, sh = _extract_quic_crypto_data(paths.pcap, port, debug)
@@ -700,44 +763,36 @@ def derive_quic(
     # Parse client random and keyshares from CH/SH
     client_random = parse_client_random_from_ch(ch)
     try:
+        ch_pub = parse_client_keyshare_pub_from_ch(ch)
         sh_pub = parse_server_keyshare_pub_from_sh(sh)
-    except Exception:
-        sh_pub = None
-
-    if not sh_pub:
-        # Try from client ephemeral public key stored during capture
-        try:
-            ch_pub = parse_client_keyshare_pub_from_ch(ch)
-        except Exception:
-            ch_pub = None
-        if ch_pub and server_e.get("priv"):
-            # Server priv + client pub
-            Z = compute_shared_secret_from_priv_and_peer(
-                server_e["priv"], binascii.hexlify(ch_pub).decode(), curve
-            )
-        else:
-            return {
-                "success": False,
-                "error": "Could not extract server KeyShare from SH",
-            }
-    else:
-        # Client priv + server pub (normal case)
-        Z = compute_shared_secret_from_priv_and_peer(
-            priv_hex, binascii.hexlify(sh_pub).decode(), curve
+        if not ch_pub or not sh_pub:
+            raise ValueError("X25519 KeyShare missing from captured hello")
+        private_hex = recovery["ephemeral_private"]
+        private_key = x25519.X25519PrivateKey.from_private_bytes(
+            bytes.fromhex(private_hex)
         )
+        recovered_public = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        if recovered_public != bytes.fromhex(recovery["ephemeral_public_check"]):
+            raise ValueError("recovered private value does not match its public check")
+        if recovery["role"] == "server":
+            own_public, peer_public = sh_pub, ch_pub
+        else:
+            own_public, peer_public = ch_pub, sh_pub
+        if recovered_public != own_public:
+            raise ValueError("recovered value does not match the captured KeyShare")
+        Z = compute_shared_secret_from_priv_and_peer(
+            private_hex, peer_public.hex(), curve
+        )
+    except (ValueError, TypeError, binascii.Error) as exc:
+        return {"success": False, "error": f"Invalid recovery input: {exc}"}
 
     if debug:
         print(f"[dbg] Shared secret Z: {binascii.hexlify(Z).decode()}")
 
     # Compute th_hello = Hash(CH || SH)
     th_hello = hashlib.new(tls_hash, ch + sh).digest()
-
-    # Load ground-truth keylog for verification
-    keylog_truth = {}
-    if paths.openssl_keylog_exists():
-        keylog_truth = parse_tls13_handshake_secrets_from_keylog(
-            paths.openssl_keylog, client_random
-        )
 
     # Derive handshake secrets
     derived_hs, trace_hs, derived_hs_hex = derive_tls13_keys_with_trace(
@@ -751,6 +806,11 @@ def derive_quic(
         cs = parse_cipher_from_server_hello(sh)
     except Exception:
         cs = 0x1301  # default
+    if cs == 0x1303:
+        return {
+            "success": False,
+            "error": "Native QUIC handshake decryption does not support ChaCha20 header protection",
+        }
 
     # Decrypt server Handshake packets to get remaining TLS messages
     encrypted_msgs = _extract_quic_decrypted_handshake(
@@ -789,7 +849,13 @@ def derive_quic(
         print("QUIC keys: PARTIAL (handshake only)")
         print(f"Output: {paths.nss_derived_keylog}")
 
-        # Still verify handshake secrets
+        # Still compare handshake secrets, but partial reconstruction is not
+        # an end-to-end success.
+        keylog_truth = {}
+        if paths.openssl_keylog_exists():
+            keylog_truth = parse_tls13_handshake_secrets_from_keylog(
+                paths.openssl_keylog, client_random
+            )
         derived_map = {
             "CLIENT_HANDSHAKE_TRAFFIC_SECRET": derived_hs_hex[
                 "client_handshake_traffic_secret"
@@ -803,9 +869,14 @@ def derive_quic(
         )
 
         return {
-            "success": ok == total,
+            "success": False,
             "keylog_path": str(paths.nss_derived_keylog),
             "handshake_only": True,
+            "validation": {
+                "ground_truth_matches": ok,
+                "ground_truth_expected": 2,
+                "application_plaintext_recovered": False,
+            },
         }
 
     # Derive full key schedule including application secrets
@@ -844,7 +915,13 @@ def derive_quic(
             )
         )
 
-    # Verify against ground-truth
+    # Verification is deliberately last: endpoint key logs never supply an
+    # attack input or intermediate value.
+    keylog_truth = {}
+    if paths.openssl_keylog_exists():
+        keylog_truth = parse_tls13_handshake_secrets_from_keylog(
+            paths.openssl_keylog, client_random
+        )
     derived_map = {
         "CLIENT_HANDSHAKE_TRAFFIC_SECRET": derived_hex[
             "client_handshake_traffic_secret"
@@ -858,16 +935,25 @@ def derive_quic(
     ok, total = print_secret_comparison(
         "QUIC", keylog_truth, derived_map, verbose=debug
     )
+    plaintext_ok = verify_quic_stream_data(
+        paths.pcap, paths.nss_derived_keylog, port, debug
+    )
 
     # Save trace
     save_key_schedule_trace(paths.derived_dir, trace, "key_schedule_trace.json", debug)
 
     status = "ALL MATCH" if ok == total else f"{ok}/{total} MATCH"
     print(f"QUIC keys: {status} ({total} secrets)")
+    print(f"QUIC plaintext: {'RECOVERED' if plaintext_ok else 'NOT VERIFIED'}")
     print(f"Output: {paths.nss_derived_keylog}")
 
     return {
-        "success": ok == total,
+        "success": ok == total and total == 4 and plaintext_ok,
         "keylog_path": str(paths.nss_derived_keylog),
         "secrets": derived_hex,
+        "validation": {
+            "ground_truth_matches": ok,
+            "ground_truth_expected": 4,
+            "application_plaintext_recovered": plaintext_ok,
+        },
     }

@@ -332,9 +332,7 @@ def decrypt_chachapoly_packet(data: bytes, key: bytes, sequence_number: int) -> 
     if not hmac.compare_digest(expected_tag, tag):
         raise ValueError("SSH packet Poly1305 authentication failed")
 
-    body = _chacha20_xor(
-        main_key, sequence_number, 1, data[4 : 4 + packet_length]
-    )
+    body = _chacha20_xor(main_key, sequence_number, 1, data[4 : 4 + packet_length])
     padding_length = body[0]
     if padding_length < 4 or padding_length + 1 >= len(body):
         raise ValueError("Invalid decrypted SSH padding")
@@ -347,7 +345,9 @@ def decrypt_chachapoly_packet(data: bytes, key: bytes, sequence_number: int) -> 
     }
 
 
-def decrypt_chachapoly_stream(data: bytes, key: bytes, first_sequence: int) -> list[dict]:
+def decrypt_chachapoly_stream(
+    data: bytes, key: bytes, first_sequence: int
+) -> list[dict]:
     """Authenticate and decrypt all complete OpenSSH ChaCha20-Poly1305 packets."""
     packets = []
     offset = 0

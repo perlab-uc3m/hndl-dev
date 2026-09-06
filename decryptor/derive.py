@@ -65,6 +65,8 @@ def main():
         args.mode = "rsa"
 
     result = derive(args.capture_dir, args.protocol, args.mode, args.debug)
+    if not result.get("success") and result.get("error"):
+        print(f"Recovery failed: {result['error']}", file=sys.stderr)
     sys.exit(0 if result.get("success") else 1)
 
 

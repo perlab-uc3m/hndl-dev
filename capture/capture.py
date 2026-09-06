@@ -81,7 +81,11 @@ def main():
 
     args = ap.parse_args()
 
+    if args.version in ("tls13", "quic") and args.group.lower() != "x25519":
+        ap.error("the recovery implementation currently supports --group X25519 only")
+
     check_tool("tshark")
+    check_tool("dumpcap")
 
     # Prepare capture directory label
     if args.label is None:

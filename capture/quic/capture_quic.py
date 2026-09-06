@@ -11,97 +11,20 @@ from pathlib import Path
 
 from ..common import (
     reader_thread,
+    persist_recovery_material,
+    write_run_manifest,
     terminate,
     generate_cert_key,
+    start_tshark,
     stop_tshark,
-    tshark_reader_thread,
-    find_or_write_openssl_conf,
 )
-
-
-def _udp_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
-    """Best-effort UDP port probe (no reliable method for QUIC)."""
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.settimeout(timeout)
-        try:
-            s.sendto(b"\x00", (host, port))
-            # If no ICMP unreachable within timeout, assume port is open
-            try:
-                s.recvfrom(1)
-            except socket.timeout:
-                return True  # No response = likely listening
-            return True
-        except Exception:
-            return False
 
 
 def _start_tshark_udp(
     pcap_file: Path, iface: str, port: int, logs_dir: Path, verbose: bool = False
 ):
-    """Start tshark on a UDP port."""
-    tshark_cmd = [
-        "tshark",
-        "-i",
-        iface,
-        "-f",
-        f"udp port {port}",
-        "-w",
-        str(pcap_file),
-    ]
-    if verbose:
-        print(f"[+] Starting capture: {' '.join(tshark_cmd)}")
-    tshark_ready = threading.Event()
-    tshark_out_log = logs_dir / "tshark_stdout.log"
-    tshark_err_log = logs_dir / "tshark_stderr.log"
-
-    try:
-        tshark = subprocess.Popen(
-            tshark_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
-    except Exception as e:
-        sys.exit(f"Failed to start tshark: {e}")
-
-    t_out = threading.Thread(
-        target=tshark_reader_thread,
-        args=(tshark.stdout, tshark_out_log, None, verbose),
-    )
-    t_err = threading.Thread(
-        target=tshark_reader_thread,
-        args=(tshark.stderr, tshark_err_log, tshark_ready, verbose),
-    )
-    t_out.daemon = True
-    t_err.daemon = True
-    t_out.start()
-    t_err.start()
-
-    if verbose:
-        print("[+] Waiting for tshark to be ready...")
-    for _ in range(30):
-        if tshark.poll() is not None:
-            err = (
-                tshark_err_log.read_text(errors="replace")
-                if tshark_err_log.exists()
-                else ""
-            )
-            out = (
-                tshark_out_log.read_text(errors="replace")
-                if tshark_out_log.exists()
-                else ""
-            )
-            sys.exit(
-                f"tshark exited before capture started.\nstdout:\n{out}\nstderr:\n{err}"
-            )
-        if tshark_ready.is_set():
-            break
-        time.sleep(0.1)
-    time.sleep(0.2)
-
-    return tshark, (t_out, t_err)
+    """Start the shared direct-dumpcap capture path with a UDP filter."""
+    return start_tshark(pcap_file, iface, port, logs_dir, verbose, transport="udp")
 
 
 def capture_quic(
@@ -111,8 +34,11 @@ def capture_quic(
     group: str,
     capture_root: Path,
     verbose: bool = False,
+    response_size: int = 256,
 ):
     """Capture a QUIC session (quic_server + openssl s_client -quic)."""
+    if response_size <= 0:
+        raise ValueError("response_size must be positive")
     # Locate quic_server binary relative to the openssl binary
     quic_server_bin = openssl.parent / "quic_server"
     if not quic_server_bin.exists():
@@ -166,6 +92,8 @@ def capture_quic(
         str(keylog_file),
         "-g",
         group,
+        "-n",
+        str(response_size),
         "-1",  # one-shot: exit after one connection
     ]
     if verbose:
@@ -210,10 +138,15 @@ def capture_quic(
         print("[+] Waiting for QUIC server to be ready...")
     for _ in range(30):
         if server.poll() is not None:
-            sys.exit("QUIC server exited prematurely")
+            stop_tshark(tshark, tshark_threads)
+            raise RuntimeError("QUIC server exited before becoming ready")
         if server_accept_event.is_set():
             break
         time.sleep(0.1)
+    if not server_accept_event.is_set():
+        terminate(server, "quic_server")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError("QUIC server did not report readiness")
     # Extra wait for UDP socket to be ready
     time.sleep(0.3)
 
@@ -275,13 +208,27 @@ def capture_quic(
         if verbose:
             print("[!] QUIC client timeout; terminating")
         terminate(client, "quic_client")
+    t_cli_out.join(timeout=1)
+    t_cli_err.join(timeout=1)
+    if client.poll() not in (0, None):
+        terminate(server, "quic_server")
+        t_srv_out.join(timeout=1)
+        t_srv_err.join(timeout=1)
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError(f"QUIC client failed with exit status {client.poll()}")
 
     # Wait for server to exit (one-shot mode)
     time.sleep(0.5)
     terminate(server, "quic_server")
+    t_srv_out.join(timeout=1)
+    t_srv_err.join(timeout=1)
 
     # Stop tshark
     stop_tshark(tshark, tshark_threads)
+
+    response = client_stdout.read_bytes() if client_stdout.exists() else b""
+    if b"A" * min(32, response_size) not in response:
+        raise RuntimeError("QUIC client did not receive the known test response")
 
     # Merge keylogs (server + client)
     if client_keylog.exists():
@@ -300,6 +247,54 @@ def capture_quic(
         for who in ("server", "client"):
             f.write(f"{who.upper()}_DEMO_EPHEMERAL_PRIV={eph_store[who].get('priv')}\n")
             f.write(f"{who.upper()}_DEMO_EPHEMERAL_PUB={eph_store[who].get('pub')}\n")
+    recovery_file, ephemeral_truth_file = persist_recovery_material(
+        keys_dir, eph_store, "client"
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    manifest_file = write_run_manifest(
+        capture_root,
+        experiment={
+            "protocol": "QUIC v1 with TLS 1.3",
+            "mode": "full 1-RTT handshake",
+            "group": group,
+            "response_bytes": response_size,
+            "network": f"{iface} capture",
+            "port": port,
+            "pcap_available": pcap_file.exists() and pcap_file.stat().st_size > 0,
+        },
+        commands={"server": server_cmd, "client": client_cmd},
+        binaries=[openssl, quic_server_bin],
+        implementation_paths=[
+            Path(__file__).resolve(),
+            repo_root / "capture/common.py",
+            repo_root / "decryptor/quic/derive_quic.py",
+            repo_root / "decryptor/io/pcap_parser.py",
+            repo_root / "patches/openssl-3.6.0-tls13-debug.patch",
+            repo_root / "patches/openssl-3.6.0-quic-server.patch",
+        ],
+        artifact_paths=[
+            pcap_file,
+            keylog_file,
+            recovery_file,
+            ephemeral_truth_file,
+            cert_pem,
+            key_pem,
+            server_stdout,
+            server_stderr,
+            client_stdout,
+            client_stderr,
+        ],
+        attack_inputs=[
+            "pcap/quic.pcapng",
+            "keys/simulated_quantum_output.json",
+        ],
+        excluded_from_attack_inputs=[
+            "keys/sslkeylog.log and keys/client_keylog.log",
+            "keys/openssl_ephemeral_ground_truth.json",
+            "keys/key.pem",
+            "process logs",
+        ],
+    )
 
     # Report
     print("Capture complete (QUIC).")
@@ -307,6 +302,9 @@ def capture_quic(
     print(f"- Key log: {keylog_file}")
     print(f"- Ephemeral (server): {server_ephem_json}")
     print(f"- Ephemeral (client): {client_ephem_json}")
+    print(f"- Simulated recovery: {recovery_file}")
+    print(f"- Comparison-only ephemeral state: {ephemeral_truth_file}")
+    print(f"- Reproduction manifest: {manifest_file}")
     print(f"- Logs: {logs_dir}")
 
     try:
@@ -322,5 +320,8 @@ def capture_quic(
         "keylog": str(keylog_file),
         "server_ephemeral": str(server_ephem_json),
         "client_ephemeral": str(client_ephem_json),
+        "simulated_recovery": str(recovery_file),
+        "ephemeral_ground_truth": str(ephemeral_truth_file),
+        "manifest": str(manifest_file),
         "logs": str(logs_dir),
     }

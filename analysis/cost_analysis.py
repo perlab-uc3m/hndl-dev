@@ -46,7 +46,7 @@ class ProtocolModel:
     handshake: int  # total handshake bytes on wire (both directions)
     tcp_hs_pkts: int  # TCP packets in handshake phase
     record_header: int  # per-record header bytes
-    aead_tag: int  # AEAD tag / MAC per record
+    aead_tag: float  # AEAD tag / MAC/padding expansion per record
     extra_per_rec: int  # fixed extra per record (e.g. TLS 1.3 content-type byte)
     padding_block_size: int  # SSH block alignment (RFC 4253 §6); 0 for TLS/QUIC
     max_record: int  # max app-data bytes per record/packet
@@ -82,7 +82,10 @@ class ProtocolModel:
                 - min_padding_overhead
             )
         else:
-            max_payload_per_rec = self.max_record - self.aead_tag - self.extra_per_rec
+            # For TLS this is the maximum application fragment; AEAD expansion
+            # is allowed outside that limit. For QUIC it is an explicitly
+            # modelled effective application payload per datagram.
+            max_payload_per_rec = self.max_record
         n_records = max(1, int(np.ceil(plaintext / max_payload_per_rec)))
         payload_per_rec = plaintext / n_records
         padding = self._ssh_padding(payload_per_rec)
@@ -114,7 +117,9 @@ TLS12_RSA = ProtocolModel(
     handshake=1620,
     tcp_hs_pkts=14,
     record_header=5,
-    aead_tag=36,  # CBC padding + HMAC-SHA1
+    # TLS 1.2 CBC: 16 B explicit IV + 20 B HMAC-SHA1 + 8.5 B mean
+    # padding (padding bytes plus the padding-length byte).
+    aead_tag=44.5,
     extra_per_rec=0,
     padding_block_size=0,
     max_record=TLS_MAX_RECORD,
@@ -151,7 +156,7 @@ TLS13_1RTT = ProtocolModel(
     aead_tag=16,  # GCM 16-byte tag
     extra_per_rec=1,  # inner content type byte
     padding_block_size=0,
-    max_record=TLS_MAX_RECORD,
+    max_record=TLS_MAX_RECORD - 1,
     channel_overhead=0,
     is_udp=False,
     color=COLOR_PALETTE[2],

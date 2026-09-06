@@ -12,14 +12,27 @@ reconstruction path may consume that value and public wire data only.
 Separately labelled endpoint state is retained solely for post-reconstruction
 comparison and is never used to supply an intermediate attack value.
 
+For TLS 1.3 and QUIC, `keys/simulated_quantum_output.json` contains exactly one
+recovered X25519 private value and its public consistency check. Peer and local
+key shares are parsed again from the capture. Complete endpoint exports are in
+`openssl_ephemeral_ground_truth.json`; the decoder never reads them. TLS 1.2
+uses `simulated_quantum_output.pem` as the recovered long-term RSA key and
+retains `key.pem` as endpoint state.
+
 ## Setup
 
 ```bash
 sudo apt install openssl wireshark tshark python3 python3-cryptography build-essential autoconf automake zlib1g-dev libssl-dev
+# Installs under ./openssl/.local, the default used by hndl.py.
 ./scripts/build_openssl.sh -c -b -i
 ./scripts/build_quic_server.sh
 ./scripts/build_openssh.sh -c -b -i
 ```
+
+Live capture also requires permission to run `dumpcap` on the selected
+interface. On Debian/Ubuntu, enable non-root packet capture during Wireshark
+package configuration and add the user to the `wireshark` group, then start a
+new login session. Verify with `dumpcap -D` before running the pipeline.
 
 ## Usage
 
@@ -34,6 +47,12 @@ python3 hndl.py --protocol tls12 --mode rsa
 python3 hndl.py --protocol quic
 ```
 
+The controlled 0-RTT scenario keeps one `s_server` process alive across ticket
+issuance and use, disables its anti-replay rejection for this first-use test,
+and fails unless OpenSSL reports both a resumed TLS 1.3 session and accepted
+early data. This setting makes the reconstruction experiment deterministic; it
+is not a deployment recommendation.
+
 The two phases can also run independently:
 
 ```bash
@@ -45,18 +64,32 @@ Output lands in `data/<timestamp>-<protocol>-capture/` with subdirectories
 `pcap/`, `keys/`, `logs/`, and `derived/`. TLS/QUIC derived secrets use NSS
 keylog format. SSH writes a JSON recovery record containing its reconstructed
 keys, authenticated-packet counts, oracle-release trace, and recovered channel
-data. SSH capture also writes `manifest.json` with exact commands, versions,
-machine details, and SHA-256 hashes of the relevant code, binaries, and evidence.
+data. Every capture writes `manifest.json` with exact commands, versions,
+machine details, the evidence boundary, and SHA-256 hashes of the relevant
+code, binaries, and evidence.
 
 ## How it works
 
 The pipeline has three stages. First, `capture/` runs a local client and server
-while tshark records the wire. The SSH experiment additionally records the two
+while dumpcap records the wire. Invoking the capture writer directly ensures
+that it has stopped and finalized the PCAP before analysis; tshark then
+dissects the retained file. The SSH experiment additionally records the two
 exact byte streams through a transparent loopback relay; this keeps the
 protocol reconstruction test runnable on hosts where dumpcap lacks capture
 permission. Second, `decryptor/` consumes the simulated asymmetric-recovery
 output and the passive archive. Third, it reconstructs the protocol key
 schedule and proves success through authenticated application-data recovery.
+TLS and QUIC success requires all expected derived secrets to match the
+comparison-only key log and tshark to recover the known application request or
+response. A missing key log, handshake-only result, or absent plaintext marker
+is a failure rather than a vacuous success.
+
+The implemented classical test configurations are deliberately narrow:
+X25519 with TLS 1.3/QUIC, RSA key transport with `AES128-SHA` for TLS 1.2, and
+Curve25519 plus `chacha20-poly1305@openssh.com` for SSH. The QUIC native
+Handshake decoder supports AES-GCM cipher suites; the capture CLI rejects
+non-X25519 groups. These boundaries are experiment scope, not claims about all
+possible protocol configurations.
 
 The SSH experiment deliberately forces `curve25519-sha256`,
 `ssh-ed25519`, and `chacha20-poly1305@openssh.com`; it does not claim these are
@@ -98,6 +131,26 @@ analysis/               Cost models, mitigation experiments, figures
 scripts/                Build scripts for patched OpenSSL/OpenSSH
 patches/                Source patches
 ```
+
+`analysis/validate_model.py` performs the advertised four-protocol payload
+sweep, including QUIC. It rejects failed or incomplete application transfers
+and excludes pure TCP ACKs while retaining UDP frames. The analytical storage
+curves are engineering models calibrated to the stated capture policy; they
+are not information-theoretic lower bounds. `analysis/monte_carlo_cost.py`
+charges the full retained inventory at each calendar year's recurring unit
+price (or only new media in explicit CapEx mode).
+
+The checked-in CSV files under `analysis/results/` are prior measurements, not
+generated fixtures. Regenerate them after capture-harness or model changes
+before using their numerical values in the paper; the scripts fail rather than
+silently recording zero-byte captures when dumpcap cannot read the interface
+or tshark cannot reopen an artifact.
+
+On Ubuntu systems whose AppArmor profile permits dumpcap to write a capture in
+the project but prevents tshark from reopening it, the tshark helper retries
+from a private, short-lived directory under `/tmp`. The original PCAP remains
+the evidence artifact and is never modified; auxiliary key logs are staged
+with mode `0600` only for that subprocess invocation.
 
 ## Formatting
 

@@ -5,7 +5,6 @@ import binascii
 import hashlib
 import json
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +13,12 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from ..core.tls12_crypto import (
     derive_tls12_keys_with_trace,
     decrypt_premaster_secret_rsa,
+)
+from ..io import (
+    get_tcp_stream_bytes,
+    list_tcp_stream_indices,
+    run_tshark,
+    verify_tls_http_request,
 )
 
 
@@ -37,7 +42,7 @@ def _tshark_field(pcap: Path, port: int, filter_expr: str, field: str) -> str:
         "-e",
         field,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_tshark(cmd, pcap)
     if result.returncode != 0:
         return ""
     return result.stdout.strip().replace(":", "").replace("\n", "")
@@ -77,68 +82,68 @@ def _check_extended_master_secret(pcap: Path, port: int) -> bool:
     ext_str = _tshark_field(
         pcap, port, "tls.handshake.type == 2", "tls.handshake.extension.type"
     )
-    return "23" in ext_str.split(",")
+    return any(token == "23" for token in ext_str.replace(",", " ").split())
+
+
+def _handshake_messages_from_stream(stream: bytes) -> list[bytes]:
+    """Reassemble plaintext TLS handshake messages from one TCP byte stream."""
+    messages = []
+    pending = bytearray()
+    offset = 0
+    while offset + 5 <= len(stream):
+        content_type = stream[offset]
+        record_len = int.from_bytes(stream[offset + 3 : offset + 5], "big")
+        end = offset + 5 + record_len
+        if end > len(stream):
+            break
+        if content_type == 22:
+            pending.extend(stream[offset + 5 : end])
+            while len(pending) >= 4:
+                msg_len = int.from_bytes(pending[1:4], "big")
+                total = 4 + msg_len
+                if len(pending) < total:
+                    break
+                messages.append(bytes(pending[:total]))
+                del pending[:total]
+        elif content_type == 20:
+            # Subsequent handshake records are encrypted under TLS 1.2.
+            break
+        offset = end
+    return messages
 
 
 def _extract_handshake_for_session_hash(pcap: Path, port: int) -> bytes:
     """Extract handshake messages for EMS session hash computation."""
-    cmd = [
-        "tshark",
-        "-r",
-        str(pcap),
-        "-d",
-        f"tcp.port=={port},tls",
-        "-Y",
-        "tls.handshake",
-        "-T",
-        "fields",
-        "-e",
-        "tcp.payload",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return None
-
-    all_handshake = b""
-    for line in result.stdout.strip().split("\n"):
-        if not line:
-            continue
+    for stream_index in list_tcp_stream_indices(pcap, port):
         try:
-            payload = binascii.unhexlify(line.replace(":", ""))
-        except (binascii.Error, ValueError):
+            side_a, side_b = get_tcp_stream_bytes(pcap, stream_index)
+        except RuntimeError:
+            continue
+        msgs_a = _handshake_messages_from_stream(side_a)
+        msgs_b = _handshake_messages_from_stream(side_b)
+        if any(msg[0] == 1 for msg in msgs_a):
+            client_msgs, server_msgs = msgs_a, msgs_b
+        elif any(msg[0] == 1 for msg in msgs_b):
+            client_msgs, server_msgs = msgs_b, msgs_a
+        else:
             continue
 
-        # Parse TLS records
-        offset = 0
-        while offset + 5 <= len(payload):
-            content_type = payload[offset]
-            record_len = int.from_bytes(payload[offset + 3 : offset + 5], "big")
-            if offset + 5 + record_len > len(payload):
+        client_hello = next((msg for msg in client_msgs if msg[0] == 1), None)
+        server_flight = []
+        for msg in server_msgs:
+            if msg[0] in (2, 11, 12, 13, 14):
+                server_flight.append(msg)
+            if msg[0] == 14:
                 break
-
-            fragment = payload[offset + 5 : offset + 5 + record_len]
-
-            if content_type == 22:  # Handshake
-                hs_offset = 0
-                while hs_offset + 4 <= len(fragment):
-                    hs_type = fragment[hs_offset]
-                    hs_len = int.from_bytes(
-                        fragment[hs_offset + 1 : hs_offset + 4], "big"
-                    )
-                    if hs_offset + 4 + hs_len > len(fragment):
-                        break
-
-                    hs_msg = fragment[hs_offset : hs_offset + 4 + hs_len]
-                    # Include: CH(1), SH(2), Cert(11), SKE(12), CertReq(13), SHD(14), CKE(16)
-                    if hs_type in (1, 2, 11, 12, 13, 14, 16):
-                        all_handshake += hs_msg
-                    if hs_type == 16:  # Stop after ClientKeyExchange
-                        return all_handshake
-                    hs_offset += 4 + hs_len
-
-            offset += 5 + record_len
-
-    return all_handshake if all_handshake else None
+        client_flight = []
+        for msg in client_msgs:
+            if msg[0] in (11, 16) and msg is not client_hello:
+                client_flight.append(msg)
+            if msg[0] == 16:
+                break
+        if client_hello and server_flight and any(m[0] == 16 for m in client_flight):
+            return b"".join([client_hello, *server_flight, *client_flight])
+    return None
 
 
 def _parse_openssl_keylog(keylog_path: Path) -> dict:
@@ -170,9 +175,12 @@ def derive_rsa(
     if not pcap.exists():
         return {"success": False, "error": f"PCAP not found: {pcap}"}
 
-    key_path = keys_dir / "key.pem"
+    key_path = keys_dir / "simulated_quantum_output.pem"
     if not key_path.exists():
-        return {"success": False, "error": f"RSA key not found: {key_path}"}
+        return {
+            "success": False,
+            "error": f"Simulated RSA recovery not found: {key_path}",
+        }
 
     derived_dir.mkdir(parents=True, exist_ok=True)
 
@@ -198,8 +206,9 @@ def derive_rsa(
     session_hash = None
     if use_ems:
         hs_msgs = _extract_handshake_for_session_hash(pcap, port)
-        if hs_msgs:
-            session_hash = hashlib.sha256(hs_msgs).digest()
+        if not hs_msgs:
+            return {"success": False, "error": "Could not reconstruct EMS transcript"}
+        session_hash = hashlib.sha256(hs_msgs).digest()
 
     # Derive master secret
     master_secret, trace = derive_tls12_keys_with_trace(
@@ -227,12 +236,20 @@ def derive_rsa(
     with keylog_out.open("w") as f:
         f.write(f"CLIENT_RANDOM {client_random_hex} {master_secret.hex()}\n")
 
+    plaintext_ok = verify_tls_http_request(pcap, keylog_out, port, debug)
+
     status = "MATCH" if match else "MISMATCH"
     print(f"TLS 1.2 RSA: {status}")
+    print(f"TLS 1.2 plaintext: {'RECOVERED' if plaintext_ok else 'NOT VERIFIED'}")
     print(f"Output: {keylog_out}")
 
     return {
-        "success": match,
+        "success": match and plaintext_ok,
         "keylog_path": str(keylog_out),
         "secrets": {"master_secret": master_secret.hex()},
+        "validation": {
+            "ground_truth_match": match,
+            "application_plaintext_recovered": plaintext_ok,
+            "extended_master_secret": use_ems,
+        },
     }

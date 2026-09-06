@@ -2,7 +2,6 @@
 """TLS 1.2 PRF and master secret derivation (RFC 5246)."""
 
 import hmac
-import hashlib
 from typing import Tuple
 
 

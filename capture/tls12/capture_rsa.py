@@ -2,16 +2,16 @@
 """TLS 1.2 RSA key-transport capture (s_server/s_client, tshark)."""
 
 import os
+import shutil
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 
 from ..common import (
     reader_thread,
+    write_run_manifest,
     terminate,
-    tcp_port_open,
     generate_cert_key,
     start_tshark,
     stop_tshark,
@@ -82,7 +82,8 @@ def capture_tls12_rsa(
     eph_store = {"server": {}, "client": {}}  # No ephemeral keys in RSA mode
     server_accept_event = threading.Event()
     t_srv_out = threading.Thread(
-        target=reader_thread, args=(server.stdout, server_stdout, "server", eph_store)
+        target=reader_thread,
+        args=(server.stdout, server_stdout, "server", eph_store, server_accept_event),
     )
     t_srv_err = threading.Thread(
         target=reader_thread,
@@ -98,10 +99,15 @@ def capture_tls12_rsa(
         print("[+] Waiting for server to be ready...")
     for _ in range(50):
         if server.poll() is not None:
-            sys.exit("Server exited prematurely")
-        if server_accept_event.is_set() or tcp_port_open("127.0.0.1", port):
+            stop_tshark(tshark, tshark_threads)
+            raise RuntimeError("TLS 1.2 server exited before becoming ready")
+        if server_accept_event.is_set():
             break
         time.sleep(0.1)
+    if not server_accept_event.is_set():
+        terminate(server, "server")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError("TLS 1.2 server did not report readiness")
 
     # Start client (TLS 1.2 RSA)
     client_cmd = [
@@ -158,18 +164,80 @@ def capture_tls12_rsa(
         if verbose:
             print("[!] Client timeout; terminating")
         terminate(client, "client")
+    t_cli_out.join(timeout=1)
+    t_cli_err.join(timeout=1)
+    if client.poll() not in (0, None):
+        terminate(server, "server")
+        t_srv_out.join(timeout=1)
+        t_srv_err.join(timeout=1)
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError(f"TLS 1.2 client failed with exit status {client.poll()}")
 
     # Stop server
     time.sleep(0.5)
     terminate(server, "server")
+    t_srv_out.join(timeout=1)
+    t_srv_err.join(timeout=1)
 
     # Stop tshark
     stop_tshark(tshark, tshark_threads)
+
+    response = client_stdout.read_bytes() if client_stdout.exists() else b""
+    if b"HTTP/" not in response:
+        raise RuntimeError("TLS 1.2 client did not receive the test HTTP response")
+
+    # This copy represents the long-term RSA private key recovered by the
+    # simulated future attacker.  The original key.pem remains endpoint state.
+    recovery_key = keys_dir / "simulated_quantum_output.pem"
+    shutil.copyfile(key_pem, recovery_key)
+    recovery_key.chmod(0o600)
+    repo_root = Path(__file__).resolve().parents[2]
+    manifest_file = write_run_manifest(
+        capture_root,
+        experiment={
+            "protocol": "TLS 1.2",
+            "mode": "RSA key transport",
+            "cipher": cipher_str,
+            "network": f"{iface} capture",
+            "port": port,
+            "pcap_available": pcap_file.exists() and pcap_file.stat().st_size > 0,
+        },
+        commands={"server": server_cmd, "client": client_cmd},
+        binaries=[openssl],
+        implementation_paths=[
+            Path(__file__).resolve(),
+            repo_root / "capture/common.py",
+            repo_root / "decryptor/tls12/derive_rsa.py",
+            repo_root / "decryptor/io/pcap_parser.py",
+        ],
+        artifact_paths=[
+            pcap_file,
+            keylog_file,
+            recovery_key,
+            cert_pem,
+            key_pem,
+            server_stdout,
+            server_stderr,
+            client_stdout,
+            client_stderr,
+        ],
+        attack_inputs=[
+            "pcap/tls12_rsa.pcapng",
+            "keys/simulated_quantum_output.pem",
+        ],
+        excluded_from_attack_inputs=[
+            "keys/sslkeylog.log",
+            "keys/key.pem",
+            "process logs",
+        ],
+    )
 
     # Report
     print("Capture complete (TLS 1.2 RSA).")
     print(f"- PCAP: {pcap_file}")
     print(f"- Key log: {keylog_file}")
+    print(f"- Simulated RSA recovery: {recovery_key}")
+    print(f"- Reproduction manifest: {manifest_file}")
     print(f"- Logs: {logs_dir}")
 
     return {
@@ -177,5 +245,7 @@ def capture_tls12_rsa(
         "mode": "rsa",
         "pcap": str(pcap_file),
         "keylog": str(keylog_file),
+        "simulated_recovery": str(recovery_key),
+        "manifest": str(manifest_file),
         "logs": str(logs_dir),
     }

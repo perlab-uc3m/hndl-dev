@@ -4,15 +4,15 @@
 import json
 import os
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 
 from ..common import (
     reader_thread,
+    persist_recovery_material,
+    write_run_manifest,
     terminate,
-    tcp_port_open,
     generate_cert_key,
     start_tshark,
     stop_tshark,
@@ -91,7 +91,8 @@ def capture_1rtt(
     }
     server_accept_event = threading.Event()
     t_srv_out = threading.Thread(
-        target=reader_thread, args=(server.stdout, server_stdout, "server", eph_store)
+        target=reader_thread,
+        args=(server.stdout, server_stdout, "server", eph_store, server_accept_event),
     )
     t_srv_err = threading.Thread(
         target=reader_thread,
@@ -107,10 +108,15 @@ def capture_1rtt(
         print("[+] Waiting for server to be ready...")
     for _ in range(50):
         if server.poll() is not None:
-            sys.exit("Server exited prematurely")
-        if server_accept_event.is_set() or tcp_port_open("127.0.0.1", port):
+            stop_tshark(tshark, tshark_threads)
+            raise RuntimeError("TLS 1.3 server exited before becoming ready")
+        if server_accept_event.is_set():
             break
         time.sleep(0.1)
+    if not server_accept_event.is_set():
+        terminate(server, "server")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError("TLS 1.3 server did not report readiness")
 
     # Start client
     client_cmd = [
@@ -167,13 +173,27 @@ def capture_1rtt(
         if verbose:
             print("[!] Client timeout; terminating")
         terminate(client, "client")
+    t_cli_out.join(timeout=1)
+    t_cli_err.join(timeout=1)
+    if client.poll() not in (0, None):
+        terminate(server, "server")
+        t_srv_out.join(timeout=1)
+        t_srv_err.join(timeout=1)
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError(f"TLS 1.3 client failed with exit status {client.poll()}")
 
     # Stop server
     time.sleep(0.5)
     terminate(server, "server")
+    t_srv_out.join(timeout=1)
+    t_srv_err.join(timeout=1)
 
     # Stop tshark
     stop_tshark(tshark, tshark_threads)
+
+    response = client_stdout.read_bytes() if client_stdout.exists() else b""
+    if b"HTTP/" not in response:
+        raise RuntimeError("TLS 1.3 client did not receive the test HTTP response")
 
     # Persist ephemeral keys
     with server_ephem_json.open("w") as f:
@@ -184,6 +204,52 @@ def capture_1rtt(
         for who in ("server", "client"):
             f.write(f"{who.upper()}_DEMO_EPHEMERAL_PRIV={eph_store[who].get('priv')}\n")
             f.write(f"{who.upper()}_DEMO_EPHEMERAL_PUB={eph_store[who].get('pub')}\n")
+    recovery_file, ephemeral_truth_file = persist_recovery_material(
+        keys_dir, eph_store, "server"
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    manifest_file = write_run_manifest(
+        capture_root,
+        experiment={
+            "protocol": "TLS 1.3",
+            "mode": "full 1-RTT handshake",
+            "group": group,
+            "network": f"{iface} capture",
+            "port": port,
+            "pcap_available": pcap_file.exists() and pcap_file.stat().st_size > 0,
+        },
+        commands={"server": server_cmd, "client": client_cmd},
+        binaries=[openssl],
+        implementation_paths=[
+            Path(__file__).resolve(),
+            repo_root / "capture/common.py",
+            repo_root / "decryptor/tls13/derive_1rtt.py",
+            repo_root / "decryptor/io/pcap_parser.py",
+            repo_root / "patches/openssl-3.6.0-tls13-debug.patch",
+        ],
+        artifact_paths=[
+            pcap_file,
+            keylog_file,
+            recovery_file,
+            ephemeral_truth_file,
+            cert_pem,
+            key_pem,
+            server_stdout,
+            server_stderr,
+            client_stdout,
+            client_stderr,
+        ],
+        attack_inputs=[
+            "pcap/tls13_1rtt.pcapng",
+            "keys/simulated_quantum_output.json",
+        ],
+        excluded_from_attack_inputs=[
+            "keys/sslkeylog.log",
+            "keys/openssl_ephemeral_ground_truth.json",
+            "keys/key.pem",
+            "process logs",
+        ],
+    )
 
     # Report
     print("Capture complete (1-RTT).")
@@ -191,6 +257,9 @@ def capture_1rtt(
     print(f"- Key log: {keylog_file}")
     print(f"- Ephemeral (server): {server_ephem_json}")
     print(f"- Ephemeral (client): {client_ephem_json}")
+    print(f"- Simulated recovery: {recovery_file}")
+    print(f"- Comparison-only ephemeral state: {ephemeral_truth_file}")
+    print(f"- Reproduction manifest: {manifest_file}")
     print(f"- Logs: {logs_dir}")
 
     try:
@@ -206,5 +275,8 @@ def capture_1rtt(
         "keylog": str(keylog_file),
         "server_ephemeral": str(server_ephem_json),
         "client_ephemeral": str(client_ephem_json),
+        "simulated_recovery": str(recovery_file),
+        "ephemeral_ground_truth": str(ephemeral_truth_file),
+        "manifest": str(manifest_file),
         "logs": str(logs_dir),
     }

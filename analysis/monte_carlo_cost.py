@@ -100,7 +100,7 @@ def _representative_alpha(payload_bytes: np.ndarray) -> np.ndarray:
     ell = 54.0
     M = 16384.0
 
-    max_payload_per_rec = M - t - e  # 16367 B
+    max_payload_per_rec = M - e  # TLSInnerPlaintext content type consumes 1 B
     n_records = np.maximum(1, np.ceil(payload_bytes / max_payload_per_rec))
     payload_per_rec = payload_bytes / n_records
     per_record = r + payload_per_rec + t + e + ell
@@ -144,7 +144,9 @@ def run_monte_carlo(cfg: MCConfig, rng: np.random.Generator):
     for fi, frac in enumerate(cfg.harvest_fractions):
         cumulative_cost[fi] = {}
         for ti, T_r in enumerate(cfg.retention_years):
-            # Each year: traffic grows by (1+g)^i, media cost declines by (1-δ)^i
+            # Calendar-year accounting.  Under recurring capacity rental, all
+            # retained cohorts are charged at that calendar year's unit price;
+            # acquisition-year pricing cannot be frozen for a cohort's life.
             cum = np.zeros(n)
             # V_0 = annual stored TB for base year
             annual_stored_bytes_base = (
@@ -153,14 +155,15 @@ def run_monte_carlo(cfg: MCConfig, rng: np.random.Generator):
             V_0 = annual_stored_bytes_base / 1e12  # TB
             C_0 = storage_cost  # $/TB
 
-            for i in range(T_r):
-                V_i = V_0 * (1 + growth_rate) ** i
-                C_i = C_0 * (1 - media_decline) ** i
+            inventory = np.zeros(n)
+            for year in range(T_r):
+                V_i = V_0 * (1 + growth_rate) ** year
+                C_i = C_0 * (1 - media_decline) ** year
                 if cfg.is_capex:
                     cum += V_i * C_i
                 else:
-                    years_retained = T_r - i
-                    cum += V_i * C_i * years_retained
+                    inventory += V_i
+                    cum += inventory * C_i
 
             cumulative_cost[fi][ti] = cum
 

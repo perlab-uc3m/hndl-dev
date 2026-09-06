@@ -9,7 +9,6 @@ quantum latency from the exchange count.
 
 import argparse
 import csv
-import json
 import os
 import subprocess
 import sys
@@ -36,7 +35,6 @@ from capture.common import (
     check_tool,
     start_tshark,
     stop_tshark,
-    reader_thread,
     terminate,
 )
 from capture.ssh.capture_ssh import (
@@ -45,6 +43,7 @@ from capture.ssh.capture_ssh import (
     write_sshd_config,
     ssh_reader_thread,
 )
+from decryptor.io import run_tshark
 
 # ---------------------------------------------------------------------------
 # Plot style
@@ -89,14 +88,16 @@ def pcap_total_bytes(pcap_path: Path, skip_pure_acks: bool = True) -> int:
         "-e",
         "tcp.len",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_tshark(cmd, pcap_path)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or "tshark failed while measuring PCAP")
     total = 0
     for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 2:
+        parts = line.split("\t")
+        if not parts or not parts[0].strip().isdigit():
             continue
-        frame_len = int(parts[0])
-        tcp_len_str = parts[1]
+        frame_len = int(parts[0].strip())
+        tcp_len_str = parts[1].strip() if len(parts) > 1 else ""
         if skip_pure_acks and tcp_len_str.isdigit() and int(tcp_len_str) == 0:
             continue
         total += frame_len
@@ -183,6 +184,10 @@ def capture_ssh_rekey(
         if server_ready.is_set():
             break
         time.sleep(0.1)
+    if server.poll() is not None or not server_ready.is_set():
+        terminate(server, "sshd")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError("sshd did not report readiness")
     time.sleep(0.3)
 
     src = "/dev/urandom" if payload_bytes <= 10_000 else "/dev/zero"
@@ -218,9 +223,11 @@ def capture_ssh_rekey(
     if verbose:
         print(f"  [ssh] {' '.join(ssh_cmd)}")
 
+    application_output = logs_dir / "application_stdout.bin"
+    application_handle = application_output.open("wb")
     client = subprocess.Popen(
         ssh_cmd,
-        stdout=subprocess.DEVNULL,
+        stdout=application_handle,
         stderr=subprocess.PIPE,
         preexec_fn=os.setsid,
     )
@@ -241,6 +248,15 @@ def capture_ssh_rekey(
         client.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         terminate(client, "ssh")
+    application_handle.close()
+    t_cli.join(timeout=1)
+    if client.returncode != 0 or application_output.stat().st_size != payload_bytes:
+        terminate(server, "sshd")
+        stop_tshark(tshark, tshark_threads)
+        raise RuntimeError(
+            f"SSH transfer failed: status={client.returncode}, "
+            f"bytes={application_output.stat().st_size}, expected={payload_bytes}"
+        )
 
     time.sleep(0.5)
     terminate(server, "sshd")
@@ -274,8 +290,9 @@ def alpha_rekey_model(
     """Analytical α for SSH with aggressive rekeying.
 
     E(P, R) = max(1, ceil(P/R)) independent DH exchanges.
-    OpenSSH counts transport-level bytes toward RekeyLimit, so
-    measured E may be lower than ceil(P/R_nominal).
+    This is an ideal plaintext-interval model. OpenSSH enforces RekeyLimit
+    using implementation-level cipher-block counters, so measured E can
+    differ and is reported independently.
     """
     if plaintext <= 0:
         return float("inf")
@@ -288,11 +305,13 @@ def alpha_rekey_model(
 
     # Data-transfer portion
     def ssh_padding(plen):
-        padded = SSH_HDR + plen + SSH_TAG
-        rem = padded % SSH_PAD_BLOCK
-        return (SSH_PAD_BLOCK - rem) if rem else 0
+        inner = SSH_HDR + plen
+        pad = (-inner) % SSH_PAD_BLOCK
+        if pad < 4:
+            pad += SSH_PAD_BLOCK
+        return pad
 
-    max_payload = SSH_MAX_PACKET
+    max_payload = SSH_MAX_PACKET - SSH_HDR - 4
     n_packets = max(1, int(np.ceil(plaintext / max_payload)))
     payload_per_pkt = plaintext / n_packets
     pad = ssh_padding(int(payload_per_pkt))

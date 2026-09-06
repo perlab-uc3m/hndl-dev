@@ -76,7 +76,10 @@ def _oracle_server(path: str, connection):
             )
             if match is None:
                 connection.send(
-                    {"ok": False, "error": "no unreleased scalar matches this public value"}
+                    {
+                        "ok": False,
+                        "error": "no unreleased scalar matches this public value",
+                    }
                 )
                 continue
             index, item = match
@@ -268,9 +271,9 @@ def _ground_truth_validation(
         "session_id": truth.get("SESSION_ID", "").lower() == H.hex(),
     }
     for truth_name, derived_name in GROUND_TRUTH_KEY_MAP.items():
-        checks[derived_name] = truth.get(truth_name, "").lower() == trace["derived"][
-            derived_name
-        ]
+        checks[derived_name] = (
+            truth.get(truth_name, "").lower() == trace["derived"][derived_name]
+        )
     return {
         "available": True,
         "all_match": all(checks.values()),
@@ -347,17 +350,19 @@ def derive_ssh(capture_dir: Path, debug: bool = False) -> dict:
         if oracle.metadata.get("algorithm") != EXPECTED_KEX:
             raise ValueError("Oracle output is not labelled for curve25519-sha256")
         if oracle.metadata.get("recovered_side") != "client":
-            raise ValueError("This reconstruction expects the recovered client exponent")
+            raise ValueError(
+                "This reconstruction expects the recovered client exponent"
+            )
 
         private_value = oracle.recover(kex["Q_C"], 0, 0)
         recovered_public = curve25519_public_from_private(private_value)
         public_matches_capture = recovered_public == kex["Q_C"]
         if not public_matches_capture:
-            raise ValueError("Recovered private value does not match the captured public value")
+            raise ValueError(
+                "Recovered private value does not match the captured public value"
+            )
 
-        shared_secret_raw = recover_curve25519_shared_secret(
-            private_value, kex["Q_S"]
-        )
+        shared_secret_raw = recover_curve25519_shared_secret(private_value, kex["Q_S"])
         shared_secret_K = encode_ssh_mpint(shared_secret_raw)
         initial_H = compute_exchange_hash(
             kex["V_C"],
@@ -377,7 +382,9 @@ def derive_ssh(capture_dir: Path, debug: bool = False) -> dict:
         _, trace = derive_ssh_keys_with_trace(
             shared_secret_K, initial_H, initial_H, "sha256", 64, 64, 64
         )
-        derived = {name: bytes.fromhex(value) for name, value in trace["derived"].items()}
+        derived = {
+            name: bytes.fromhex(value) for name, value in trace["derived"].items()
+        }
         epoch_traces = [
             {
                 "epoch": 0,
@@ -485,7 +492,9 @@ def derive_ssh(capture_dir: Path, debug: bool = False) -> dict:
         recovered_channel_data = b"".join(channel_chunks)
         expected_plaintext_recovered = b"SSH_TEST_OK" in recovered_channel_data
         if not expected_plaintext_recovered:
-            raise ValueError("Authenticated packets did not contain expected test plaintext")
+            raise ValueError(
+                "Authenticated packets did not contain expected test plaintext"
+            )
 
         # This file is intentionally opened only after archive-only recovery
         # and authentication have succeeded.
