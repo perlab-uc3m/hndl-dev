@@ -9,6 +9,7 @@ __pycache__/
 # Build artifacts (local OpenSSL/OpenSSH)
 /openssl
 /openssh
+/openssh-benchmark
 
 # Capture data
 data/

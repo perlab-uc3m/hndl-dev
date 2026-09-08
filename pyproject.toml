@@ -19,7 +19,7 @@ dev = ["black==25.1.0", "pytest>=8"]
 hndl = "hndl:main"
 
 [tool.setuptools]
-py-modules = ["hndl", "experiment"]
+py-modules = ["hndl", "experiment", "archive_policy"]
 
 [tool.setuptools.packages.find]
 include = ["capture*", "decryptor*"]

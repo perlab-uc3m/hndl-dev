@@ -63,6 +63,17 @@ def resolve_recovery_spec(
 
 def _derive_mapping(capture_path: Path, spec: RecoverySpec, debug: bool) -> dict:
     if spec.protocol is Protocol.TLS13:
+        if spec.mode is Mode.EXTERNAL_PSK:
+            from .tls13.derive_external_psk import derive_external_psk
+
+            return derive_external_psk(
+                capture_path,
+                pcap_name=spec.archives[0],
+                port=spec.port,
+                recovery_name=spec.simulated_recovery,
+                ground_truth_name=spec.ground_truth[0],
+                debug=debug,
+            )
         if spec.mode is Mode.ZERO_RTT:
             from .tls13.derive_0rtt import derive_0rtt
 
@@ -106,6 +117,7 @@ def _derive_mapping(capture_path: Path, spec: RecoverySpec, debug: bool) -> dict
             debug=debug,
             recovery_name=spec.simulated_recovery,
             ground_truth_name=spec.ground_truth[0],
+            archive_names=spec.archives,
         )
 
     from .quic.derive_quic import derive_quic
@@ -127,6 +139,9 @@ def _record_provenance(capture_path: Path, spec: RecoverySpec, result: dict) -> 
     layout = ArtifactLayout(capture_path)
     decryptor_root = Path(__file__).parent
     implementations = [Path(__file__), decryptor_root / "io/pcap_parser.py"]
+    manifest_data = RunManifest.load(capture_path).data
+    if isinstance(manifest_data.get("archive_policy"), dict):
+        implementations.append(Path(__file__).parents[1] / "archive_policy.py")
     if spec.protocol is Protocol.TLS12:
         implementations.extend(
             [
@@ -135,17 +150,20 @@ def _record_provenance(capture_path: Path, spec: RecoverySpec, result: dict) -> 
             ]
         )
     elif spec.protocol is Protocol.TLS13:
-        implementations.extend(
-            [
-                decryptor_root
-                / (
-                    "tls13/derive_0rtt.py"
-                    if spec.mode is Mode.ZERO_RTT
-                    else "tls13/derive_1rtt.py"
-                ),
-                decryptor_root / "core/tls13_crypto.py",
-            ]
+        implementation = (
+            "tls13/derive_0rtt.py"
+            if spec.mode is Mode.ZERO_RTT
+            else (
+                "tls13/derive_external_psk.py"
+                if spec.mode is Mode.EXTERNAL_PSK
+                else "tls13/derive_1rtt.py"
+            )
         )
+        implementations.extend(
+            [decryptor_root / implementation, decryptor_root / "core/tls13_crypto.py"]
+        )
+        if spec.mode is Mode.EXTERNAL_PSK:
+            implementations.append(decryptor_root / "tls13/derive_resumption.py")
     elif spec.protocol is Protocol.QUIC:
         implementations.extend(
             [
@@ -214,7 +232,14 @@ def recover_protocol(
         )
     try:
         spec = resolve_recovery_spec(capture_path, protocol, mode, port)
-        result = _derive_mapping(capture_path, spec, debug)
+        # Reassembled and compact policy archives contain only wire-visible
+        # protocol units.  A short-lived PCAP envelope lets the existing,
+        # independently tested decoders consume those bytes without treating
+        # synthetic headers as retained evidence.
+        from archive_policy import materialized_recovery_spec
+
+        with materialized_recovery_spec(capture_path, spec) as decoder_spec:
+            result = _derive_mapping(capture_path, decoder_spec, debug)
         if result.get("success"):
             _record_provenance(capture_path, spec, result)
         return RecoveryResult.from_mapping(capture_path, spec, result)

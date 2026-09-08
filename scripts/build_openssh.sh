@@ -174,11 +174,16 @@ build_openssh() {
   
   pushd "$SRC_DIR" > /dev/null
   
-  # The tagged portable source includes configure. Regenerate it only when
-  # absent; comparing checkout mtimes causes needless autoreconf dependencies.
-  if [ ! -x "configure" ]; then
-    echov "Running autoreconf (configure missing)..."
+  # The tagged portable source includes a matching generated configure script.
+  # A Git checkout can nevertheless give configure.ac a newer wall-clock mtime,
+  # which makes configure abort. Refresh only that generated timestamp when the
+  # input is unmodified; genuinely edited or missing build files need autoreconf.
+  if [ ! -x "configure" ] || ! git diff --quiet -- configure.ac; then
+    echov "Running autoreconf (configure missing or configure.ac modified)..."
     autoreconf -fvi
+  elif [ "configure.ac" -nt "configure" ]; then
+    echov "Refreshing generated configure timestamp after Git checkout..."
+    touch configure
   fi
   
   echov "Configuring OpenSSH (prefix=$LOCAL_PREFIX)"

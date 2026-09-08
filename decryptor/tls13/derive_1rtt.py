@@ -220,7 +220,8 @@ def derive_1rtt(
     # Verification is deliberately last: endpoint key logs never supply an
     # attack input or intermediate value.
     keylog_truth = {}
-    if paths.openssl_keylog_exists():
+    ground_truth_available = paths.openssl_keylog_exists()
+    if ground_truth_available:
         keylog_truth = parse_tls13_handshake_secrets_from_keylog(
             paths.openssl_keylog, client_random
         )
@@ -234,9 +235,12 @@ def derive_1rtt(
         "CLIENT_TRAFFIC_SECRET_0": derived_hex["client_application_traffic_secret"],
         "SERVER_TRAFFIC_SECRET_0": derived_hex["server_application_traffic_secret"],
     }
-    ok, total = print_secret_comparison(
-        "TLS 1.3", keylog_truth, derived_map, verbose=debug
-    )
+    if ground_truth_available:
+        ok, total = print_secret_comparison(
+            "TLS 1.3", keylog_truth, derived_map, verbose=debug
+        )
+    else:
+        ok, total = 0, 0
     plaintext_ok = verify_tls_http_request(
         paths.pcap, paths.nss_derived_keylog, port, debug
     )
@@ -244,18 +248,29 @@ def derive_1rtt(
     # Save trace
     save_key_schedule_trace(paths.derived_dir, trace, "key_schedule_trace.json", debug)
 
-    status = "ALL MATCH" if ok == total else f"{ok}/{total} MATCH"
-    print(f"TLS 1.3 keys: {status} ({total} secrets)")
+    status = (
+        "ALL MATCH"
+        if ground_truth_available and ok == total == 4
+        else ("NOT PROVIDED" if not ground_truth_available else f"{ok}/{total} MATCH")
+    )
+    comparison = (
+        f"{total} compared secrets" if ground_truth_available else "comparison omitted"
+    )
+    print(f"TLS 1.3 keys: {status} ({comparison})")
     print(f"TLS 1.3 plaintext: {'RECOVERED' if plaintext_ok else 'NOT VERIFIED'}")
     print(f"Output: {paths.nss_derived_keylog}")
 
     return {
-        "success": ok == total and total == 4 and plaintext_ok,
+        "success": (
+            (not ground_truth_available or (ok == total and total == 4))
+            and plaintext_ok
+        ),
         "keylog_path": str(paths.nss_derived_keylog),
         "secrets": derived_hex,
         "validation": {
             "ground_truth_matches": ok,
             "ground_truth_expected": 4,
+            "ground_truth_available": ground_truth_available,
             "application_plaintext_recovered": plaintext_ok,
         },
     }

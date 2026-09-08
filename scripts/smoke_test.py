@@ -19,6 +19,12 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from archive_policy import ArchivePolicy, build_policy_archive
+from decryptor.derive import recover_protocol
+
 DROP_RE = re.compile(r"Packets received/dropped.*?:\s*(\d+)/(\d+)")
 MANIFEST_SCHEMAS = {"hndl-run-manifest-v1", "hndl-ssh-run-manifest-v1"}
 
@@ -109,6 +115,20 @@ def _scenarios(ssh_payload_bytes: int, ssh_rekey_limit: str) -> list[Scenario]:
                 "pcap/tls13_0rtt_phase2_resumption.pcapng",
             ),
             "derived/nss_0rtt.keylog",
+        ),
+        Scenario(
+            "TLS 1.3 ext-PSK",
+            "tls13-external-psk",
+            (
+                "-p",
+                "tls13",
+                "-m",
+                "external-psk",
+                "--port",
+                str(_available_port(socket.SOCK_STREAM)),
+            ),
+            ("pcap/tls13_external_psk.pcapng",),
+            "derived/nss_external_psk.keylog",
         ),
         Scenario(
             "QUIC",
@@ -251,7 +271,11 @@ def _terminate_processes(processes: list[int]) -> None:
 
 
 def _run_scenario(
-    scenario: Scenario, work_root: Path, verbose: bool, timeout_seconds: float
+    scenario: Scenario,
+    work_root: Path,
+    verbose: bool,
+    timeout_seconds: float,
+    archive_policies: bool,
 ) -> Outcome:
     data_root = work_root / scenario.slug
     data_root.mkdir()
@@ -301,7 +325,22 @@ def _run_scenario(
     try:
         if result.returncode != 0:
             raise RuntimeError(f"pipeline exited with status {result.returncode}")
-        detail = _validate_capture(_capture_directory(data_root), scenario)
+        capture = _capture_directory(data_root)
+        detail = _validate_capture(capture, scenario)
+        if archive_policies:
+            policy_root = data_root / "policy-archives"
+            for policy in ArchivePolicy:
+                built = build_policy_archive(
+                    capture,
+                    policy_root / f"{capture.name}-{policy.value}",
+                    policy,
+                )
+                recovery = recover_protocol(built.root)
+                if not recovery.success or not recovery.plaintext_authenticated:
+                    raise RuntimeError(
+                        f"{policy.value} archive recovery failed: {recovery.error}"
+                    )
+            detail += ", 3 archive policies"
         time.sleep(0.2)
         remnants = _matching_processes(str(data_root))
         if remnants:
@@ -336,6 +375,11 @@ def main() -> int:
     parser.add_argument("--ssh-payload-bytes", type=int, default=100_000)
     parser.add_argument("--ssh-rekey-limit", default="64K")
     parser.add_argument(
+        "--archive-policies",
+        action="store_true",
+        help="also prove raw, reassembled, and compact standalone archives",
+    )
+    parser.add_argument(
         "--timeout-seconds",
         type=float,
         default=90,
@@ -357,7 +401,13 @@ def main() -> int:
     work_root = Path(tempfile.mkdtemp(prefix="hndl-smoke-"))
     print(f"Artifacts: {work_root}")
     outcomes = [
-        _run_scenario(scenario, work_root, args.verbose, args.timeout_seconds)
+        _run_scenario(
+            scenario,
+            work_root,
+            args.verbose,
+            args.timeout_seconds,
+            args.archive_policies,
+        )
         for scenario in _scenarios(args.ssh_payload_bytes, args.ssh_rekey_limit)
     ]
     _print_summary(outcomes)

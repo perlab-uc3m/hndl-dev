@@ -501,6 +501,38 @@ def parse_new_session_ticket(nst_msg: bytes) -> dict:
     }
 
 
+def extract_psk_identity_from_client_hello(ch_msg: bytes) -> bytes | None:
+    """Return the first offered TLS 1.3 PSK identity from a ClientHello."""
+    offset = 4 + 2 + 32
+    if offset >= len(ch_msg):
+        return None
+    session_id_len = ch_msg[offset]
+    offset += 1 + session_id_len
+    if offset + 2 > len(ch_msg):
+        return None
+    cipher_suites_len = int.from_bytes(ch_msg[offset : offset + 2], "big")
+    offset += 2 + cipher_suites_len
+    if offset >= len(ch_msg):
+        return None
+    compression_len = ch_msg[offset]
+    offset += 1 + compression_len
+    if offset + 2 > len(ch_msg):
+        return None
+    extensions_len = int.from_bytes(ch_msg[offset : offset + 2], "big")
+    offset += 2
+    extensions_end = offset + extensions_len
+    while offset + 4 <= extensions_end:
+        extension_type = int.from_bytes(ch_msg[offset : offset + 2], "big")
+        extension_len = int.from_bytes(ch_msg[offset + 2 : offset + 4], "big")
+        extension = ch_msg[offset + 4 : offset + 4 + extension_len]
+        if extension_type == 41 and len(extension) >= 4:
+            identity_len = int.from_bytes(extension[2:4], "big")
+            if len(extension) >= 4 + identity_len:
+                return extension[4 : 4 + identity_len]
+        offset += 4 + extension_len
+    return None
+
+
 def parse_client_hello_without_binders(ch_msg: bytes) -> bytes:
     """Remove PSK binders from ClientHello for transcript hash computation.
 
@@ -718,6 +750,44 @@ def verify_tls_http_request(
             except ValueError:
                 continue
             if b"GET / HTTP/1.0" in plaintext:
+                return True
+    return False
+
+
+def verify_tls_http_response(
+    pcap_file: Path, keylog_file: Path, port: int, debug: bool = False
+) -> bool:
+    """Prove that resumed 1-RTT keys authenticate the controlled response."""
+    cmd = [
+        "tshark",
+        "-r",
+        str(pcap_file),
+        "-o",
+        f"tls.keylog_file:{keylog_file}",
+        "-d",
+        f"tcp.port=={port},tls",
+        "-T",
+        "fields",
+        "-e",
+        "http.response.code",
+        "-e",
+        "tls.segment.data",
+    ]
+    result = run_tshark(cmd, pcap_file, (keylog_file,))
+    if debug and result.returncode != 0:
+        print(f"[dbg] tshark response validation failed: {result.stderr}")
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if fields and fields[0].strip().isdigit():
+            return True
+        for value in fields[1:]:
+            try:
+                plaintext = bytes.fromhex(value.replace(":", "").replace(",", ""))
+            except ValueError:
+                continue
+            if b"HTTP/1.0 200" in plaintext or b"s_server" in plaintext:
                 return True
     return False
 

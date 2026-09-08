@@ -219,6 +219,7 @@ def derive_rsa(
     # Verify against OpenSSL keylog
     keylog_path = capture_path / ground_truth_name
     openssl_secrets = _parse_openssl_keylog(keylog_path)
+    ground_truth_available = bool(openssl_secrets)
     client_random_hex = client_random.hex()
 
     match = False
@@ -235,17 +236,23 @@ def derive_rsa(
 
     plaintext_ok = verify_tls_http_request(pcap, keylog_out, port, debug)
 
-    status = "MATCH" if match else "MISMATCH"
+    validation_ok = match if ground_truth_available else True
+    status = (
+        "MATCH"
+        if match
+        else ("NOT PROVIDED" if not ground_truth_available else "MISMATCH")
+    )
     print(f"TLS 1.2 RSA: {status}")
     print(f"TLS 1.2 plaintext: {'RECOVERED' if plaintext_ok else 'NOT VERIFIED'}")
     print(f"Output: {keylog_out}")
 
     return {
-        "success": match and plaintext_ok,
+        "success": validation_ok and plaintext_ok,
         "keylog_path": str(keylog_out),
         "secrets": {"master_secret": master_secret.hex()},
         "validation": {
             "ground_truth_match": match,
+            "ground_truth_available": ground_truth_available,
             "application_plaintext_recovered": plaintext_ok,
             "extended_master_secret": use_ems,
         },

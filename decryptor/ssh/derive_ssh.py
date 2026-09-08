@@ -87,10 +87,24 @@ def _classify_streams(first: bytes, second: bytes) -> tuple[bytes, bytes, dict]:
     raise ValueError("Could not classify SSH directions: " + "; ".join(errors))
 
 
-def _load_wire_data(capture_path: Path) -> tuple[bytes, bytes, dict, str]:
+def _load_wire_data(
+    capture_path: Path, archive_names: tuple[str, ...] | None = None
+) -> tuple[bytes, bytes, dict, str]:
     """Load passive wire bytes from PCAP, with recorded streams as fallback."""
-    pcap = capture_path / "pcap" / "ssh_session.pcapng"
-    if pcap.exists() and pcap.stat().st_size:
+    names = archive_names or (
+        "pcap/ssh_session.pcapng",
+        "pcap/ssh_client_to_server.bin",
+        "pcap/ssh_server_to_client.bin",
+    )
+    pcap = next(
+        (
+            capture_path / name
+            for name in names
+            if Path(name).suffix in {".pcap", ".pcapng"}
+        ),
+        None,
+    )
+    if pcap is not None and pcap.exists() and pcap.stat().st_size:
         errors = []
         for stream_index in list_tcp_stream_indices(pcap):
             try:
@@ -101,8 +115,15 @@ def _load_wire_data(capture_path: Path) -> tuple[bytes, bytes, dict, str]:
                 errors.append(f"stream {stream_index}: {exc}")
         raise ValueError("No complete SSH KEX in PCAP: " + "; ".join(errors))
 
-    client_file = capture_path / "pcap" / "ssh_client_to_server.bin"
-    server_file = capture_path / "pcap" / "ssh_server_to_client.bin"
+    stream_names = [name for name in names if Path(name).suffix == ".bin"]
+    if len(stream_names) >= 2:
+        client_file, server_file = (
+            capture_path / stream_names[0],
+            capture_path / stream_names[1],
+        )
+    else:
+        client_file = capture_path / "pcap" / "ssh_client_to_server.bin"
+        server_file = capture_path / "pcap" / "ssh_server_to_client.bin"
     if not client_file.exists() or not server_file.exists():
         raise FileNotFoundError("Neither a usable PCAP nor both SSH wire streams exist")
     client = client_file.read_bytes()
@@ -192,6 +213,7 @@ def derive_ssh(
     debug: bool = False,
     recovery_name: str = "keys/simulated_quantum_output.json",
     ground_truth_name: str = "keys/ssh_ground_truth.json",
+    archive_names: tuple[str, ...] | None = None,
 ) -> dict:
     """Run passive SSH capture-to-decryption under the simulated CRQC model."""
     capture_path = Path(capture_dir)
@@ -201,7 +223,7 @@ def derive_ssh(
     oracle = None
 
     try:
-        _, _, kex, archive_source = _load_wire_data(capture_path)
+        _, _, kex, archive_source = _load_wire_data(capture_path, archive_names)
         oracle = SimulatedQuantumOracle(capture_path / recovery_name)
 
         negotiated = kex["negotiated"]

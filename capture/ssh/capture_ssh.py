@@ -190,8 +190,22 @@ def write_sshd_config(
     auth_keys: Path,
     port: int,
     rekey_limit: str | None = None,
+    log_level: str = "DEBUG3",
 ) -> Path:
     """Write minimal sshd_config for testing."""
+    normalized_log_level = log_level.upper()
+    if normalized_log_level not in {
+        "QUIET",
+        "FATAL",
+        "ERROR",
+        "INFO",
+        "VERBOSE",
+        "DEBUG",
+        "DEBUG1",
+        "DEBUG2",
+        "DEBUG3",
+    }:
+        raise ValueError(f"unsupported sshd log level: {log_level}")
     rekey_line = f"\nRekeyLimit {rekey_limit}" if rekey_limit else ""
     config_path.write_text(
         f"""
@@ -203,9 +217,8 @@ PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
 StrictModes no
-UsePAM no
 Subsystem sftp /usr/lib/openssh/sftp-server
-LogLevel DEBUG3
+LogLevel {normalized_log_level}
 KexAlgorithms curve25519-sha256
 Ciphers chacha20-poly1305@openssh.com
 HostKeyAlgorithms ssh-ed25519

@@ -29,8 +29,10 @@ def capture_0rtt(
     group: str,
     capture_root: Path,
     verbose: bool = False,
+    resumption_kex: str = "psk-dhe",
+    capture_grandchild: bool = False,
 ):
-    """Capture a TLS 1.3 0-RTT session (initial handshake + resumption with early data)."""
+    """Capture a TLS 1.3 parent/child and optional grandchild chain."""
     layout = ArtifactLayout(capture_root)
     layout.create_capture_dirs()
     pcap_dir, logs_dir, keys_dir = (
@@ -43,16 +45,19 @@ def capture_0rtt(
     cert_pem = keys_dir / "cert.pem"
     key_pem = keys_dir / "key.pem"
     session_file = keys_dir / "session_0rtt.pem"
+    child_session_file = keys_dir / "session_grandchild.pem"
     early_data_file = keys_dir / "early_data_request.txt"
     pcap_file_phase1 = pcap_dir / "tls13_0rtt_phase1_initial.pcapng"
     pcap_file_phase2 = pcap_dir / "tls13_0rtt_phase2_resumption.pcapng"
+    pcap_file_phase3 = pcap_dir / "tls13_0rtt_phase3_grandchild.pcapng"
     server_ephem_json = keys_dir / "server_ephemeral.json"
     client_ephem_json = keys_dir / "client_ephemeral.json"
     combined_ephem_txt = keys_dir / "ephemeral_combined.txt"
 
     if verbose:
         print(f"[+] Output dir: {capture_root}")
-        print("[+] Mode: 0-RTT (two-phase capture)")
+        phases = "three" if capture_grandchild else "two"
+        print(f"[+] Mode: 0-RTT ({phases}-phase capture)")
 
     # Generate cert/key
     base_env = generate_cert_key(openssl, cert_pem, key_pem, keys_dir, verbose)
@@ -94,6 +99,8 @@ def capture_0rtt(
         "-keylogfile",
         str(keylog_file),
     ]
+    if resumption_kex == "psk-only":
+        server_cmd.extend(["-allow_no_dhe_kex", "-prefer_no_dhe_kex"])
     if verbose:
         print(f"[+] Starting server (phase 1): {' '.join(server_cmd)}")
 
@@ -283,6 +290,10 @@ def capture_0rtt(
         # can prove that this was a resumed handshake with accepted early data.
         "-ign_eof",
     ]
+    if capture_grandchild:
+        client2_cmd.extend(["-sess_out", str(child_session_file)])
+    if resumption_kex == "psk-only":
+        client2_cmd.extend(["-allow_no_dhe_kex", "-prefer_no_dhe_kex"])
     if verbose:
         print(f"[+] Starting client (phase 2) with early data: {' '.join(client2_cmd)}")
 
@@ -340,18 +351,111 @@ def capture_0rtt(
         stop_capture(capture2, capture2_threads)
         raise RuntimeError("phase 2 resumed, but the server rejected early data")
 
-    # Stop the persistent server after both connections.
+    # Give dumpcap time to drain a very short resumption before signaling it.
+    time.sleep(0.5)
+
+    # Snapshot phase 2 before an optional third connection can replace the
+    # latest value observed by the persistent server reader.
+    if resumption_kex == "psk-dhe":
+        eph_store_phase2["server"] = dict(eph_store_phase1["server"])
+    stop_capture(capture2, capture2_threads)
+
+    client3_cmd = None
+    client3_stdout = logs_dir / "phase3_client_stdout.log"
+    client3_stderr = logs_dir / "phase3_client_stderr.log"
+    if capture_grandchild:
+        if not child_session_file.is_file() or child_session_file.stat().st_size == 0:
+            terminate(server1, "server")
+            raise RuntimeError("phase 2 did not save a ticket for the grandchild")
+        time.sleep(0.5)
+        capture3, capture3_threads = start_capture(
+            pcap_file_phase3, iface, port, logs_dir / "phase3", verbose
+        )
+        client3_cmd = [
+            str(openssl),
+            "s_client",
+            "-connect",
+            f"127.0.0.1:{port}",
+            "-tls1_3",
+            "-groups",
+            group,
+            "-servername",
+            "localhost",
+            "-sess_in",
+            str(child_session_file),
+            "-early_data",
+            str(early_data_file),
+            "-keylogfile",
+            str(keylog_file),
+            "-ign_eof",
+        ]
+        if resumption_kex == "psk-only":
+            client3_cmd.extend(["-allow_no_dhe_kex", "-prefer_no_dhe_kex"])
+        if verbose:
+            print(
+                f"[+] Starting client (phase 3) with child ticket: "
+                f"{' '.join(client3_cmd)}"
+            )
+        eph_store_phase3 = {
+            "server": {"priv": None, "pub": None},
+            "client": {"priv": None, "pub": None},
+        }
+        client3 = start_process(
+            client3_cmd,
+            "TLS 1.3 grandchild client",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            text=False,
+            preexec_fn=os.setsid,
+            env=base_env,
+        )
+        t_cli3_out = threading.Thread(
+            target=reader_thread,
+            args=(client3.stdout, client3_stdout, "client", eph_store_phase3),
+            daemon=True,
+        )
+        t_cli3_err = threading.Thread(
+            target=reader_thread,
+            args=(client3.stderr, client3_stderr, "client", eph_store_phase3),
+            daemon=True,
+        )
+        t_cli3_out.start()
+        t_cli3_err.start()
+        try:
+            client3.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        try:
+            client3.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            if verbose:
+                print("[!] Client (phase 3) timeout; terminating")
+            terminate(client3, "client3")
+        t_cli3_out.join(timeout=1)
+        t_cli3_err.join(timeout=1)
+        phase3_summary = (
+            client3_stdout.read_text(errors="replace")
+            if client3_stdout.exists()
+            else ""
+        )
+        if "Reused, TLSv1.3" not in phase3_summary:
+            terminate(server1, "server")
+            stop_capture(capture3, capture3_threads)
+            raise RuntimeError("phase 3 did not resume the child ticket")
+        if "Early data was accepted" not in phase3_summary:
+            terminate(server1, "server")
+            stop_capture(capture3, capture3_threads)
+            raise RuntimeError("phase 3 resumed, but early data was rejected")
+        time.sleep(0.5)
+        stop_capture(capture3, capture3_threads)
+
+    # Stop the persistent server only after every linked session is complete.
     time.sleep(0.5)
     terminate(server1, "server")
     t_srv1_out.join(timeout=1)
     t_srv1_err.join(timeout=1)
-
-    # The persistent server reader now contains the latest (phase-2) pair.
-    eph_store_phase2["server"] = dict(eph_store_phase1["server"])
     eph_store_phase1["server"] = server_phase1
-
-    # Finalize phase-2 packet capture.
-    stop_capture(capture2, capture2_threads)
 
     # Persist ephemeral keys for BOTH phases
     # Phase 1 keys (for breaking initial handshake)
@@ -362,13 +466,14 @@ def capture_0rtt(
     with client_ephem_phase1_json.open("w") as f:
         json.dump(eph_store_phase1["client"], f, indent=2)
 
-    # Phase 2 keys (for completeness, though not needed for 0-RTT decryption)
+    # Phase 2 keys are absent by construction for a pure-PSK child.
     server_ephem_phase2_json = keys_dir / "server_ephemeral_phase2.json"
     client_ephem_phase2_json = keys_dir / "client_ephemeral_phase2.json"
-    with server_ephem_phase2_json.open("w") as f:
-        json.dump(eph_store_phase2["server"], f, indent=2)
-    with client_ephem_phase2_json.open("w") as f:
-        json.dump(eph_store_phase2["client"], f, indent=2)
+    if resumption_kex == "psk-dhe":
+        with server_ephem_phase2_json.open("w") as f:
+            json.dump(eph_store_phase2["server"], f, indent=2)
+        with client_ephem_phase2_json.open("w") as f:
+            json.dump(eph_store_phase2["client"], f, indent=2)
 
     # For backward compatibility, use Phase 1 keys as the main ephemeral keys
     with server_ephem_json.open("w") as f:
@@ -384,17 +489,30 @@ def capture_0rtt(
             f.write(
                 f"PHASE1_{who.upper()}_EPHEMERAL_PUB={eph_store_phase1[who].get('pub')}\n"
             )
-        f.write("\n# Phase 2 (0-RTT resumption) ephemeral keys\n")
-        for who in ("server", "client"):
-            f.write(
-                f"PHASE2_{who.upper()}_EPHEMERAL_PRIV={eph_store_phase2[who].get('priv')}\n"
-            )
-            f.write(
-                f"PHASE2_{who.upper()}_EPHEMERAL_PUB={eph_store_phase2[who].get('pub')}\n"
-            )
+        f.write(f"\n# Phase 2 (0-RTT resumption): {resumption_kex}\n")
+        if resumption_kex == "psk-dhe":
+            for who in ("server", "client"):
+                f.write(
+                    f"PHASE2_{who.upper()}_EPHEMERAL_PRIV={eph_store_phase2[who].get('priv')}\n"
+                )
+                f.write(
+                    f"PHASE2_{who.upper()}_EPHEMERAL_PUB={eph_store_phase2[who].get('pub')}\n"
+                )
+        else:
+            f.write("PHASE2_FRESH_DH=none\n")
     recovery_file, ephemeral_truth_file = persist_recovery_material(
         keys_dir, eph_store_phase1, "server"
     )
+    phase2_recovery_file = None
+    phase2_ephemeral_truth_file = None
+    if resumption_kex == "psk-dhe":
+        phase2_recovery_file, phase2_ephemeral_truth_file = persist_recovery_material(
+            keys_dir,
+            eph_store_phase2,
+            "server",
+            oracle_name="simulated_quantum_output_phase2.json",
+            truth_name="openssl_ephemeral_phase2_ground_truth.json",
+        )
     repo_root = Path(__file__).resolve().parents[2]
     manifest_file = write_run_manifest(
         capture_root,
@@ -406,23 +524,30 @@ def capture_0rtt(
             "port": port,
             "resumption_confirmed": True,
             "early_data_accepted": True,
+            "resumption_key_exchange": resumption_kex,
+            "grandchild_captured": capture_grandchild,
             "phase1_pcap_available": (
                 pcap_file_phase1.exists() and pcap_file_phase1.stat().st_size > 0
             ),
             "phase2_pcap_available": (
                 pcap_file_phase2.exists() and pcap_file_phase2.stat().st_size > 0
             ),
+            "optional_phase2_recovery": (
+                phase2_recovery_file.name if phase2_recovery_file else None
+            ),
         },
         commands={
             "server": server_cmd,
             "initial_client": client1_cmd,
             "resumption_client": client2_cmd,
-        },
+        }
+        | ({"grandchild_client": client3_cmd} if client3_cmd else {}),
         binaries=[openssl],
         implementation_paths=[
             Path(__file__).resolve(),
             repo_root / "capture/common.py",
             repo_root / "decryptor/tls13/derive_0rtt.py",
+            repo_root / "decryptor/tls13/derive_resumption.py",
             repo_root / "decryptor/io/pcap_parser.py",
             repo_root / "patches/openssl-3.6.0-tls13-debug.patch",
         ],
@@ -442,7 +567,22 @@ def capture_0rtt(
             client1_stderr,
             client2_stdout,
             client2_stderr,
-        ],
+        ]
+        + (
+            [phase2_recovery_file, phase2_ephemeral_truth_file]
+            if phase2_recovery_file and phase2_ephemeral_truth_file
+            else []
+        )
+        + (
+            [
+                pcap_file_phase3,
+                child_session_file,
+                client3_stdout,
+                client3_stderr,
+            ]
+            if capture_grandchild
+            else []
+        ),
         attack_inputs=[
             "pcap/tls13_0rtt_phase1_initial.pcapng",
             "pcap/tls13_0rtt_phase2_resumption.pcapng",
@@ -451,7 +591,9 @@ def capture_0rtt(
         excluded_from_attack_inputs=[
             "keys/sslkeylog.log",
             "keys/openssl_ephemeral_ground_truth.json",
+            "keys/openssl_ephemeral_phase2_ground_truth.json",
             "keys/session_0rtt.pem",
+            "keys/session_grandchild.pem",
             "keys/key.pem",
             "process logs",
         ],
@@ -459,14 +601,21 @@ def capture_0rtt(
     )
 
     # Report
-    print("\nCapture complete (0-RTT two-phase).")
+    phases = "three-phase" if capture_grandchild else "two-phase"
+    print(f"\nCapture complete (0-RTT {phases}).")
     print(f"- PCAP (phase 1 - initial): {pcap_file_phase1}")
     print(f"- PCAP (phase 2 - 0-RTT):   {pcap_file_phase2}")
+    if capture_grandchild:
+        print(f"- PCAP (phase 3 - grandchild): {pcap_file_phase3}")
     print(f"- Key log: {keylog_file}")
     print(f"- Session ticket: {session_file}")
     print(f"- Ephemeral (server): {server_ephem_json}")
     print(f"- Ephemeral (client): {client_ephem_json}")
     print(f"- Simulated recovery: {recovery_file}")
+    if phase2_recovery_file:
+        print(f"- Phase-2 simulated recovery: {phase2_recovery_file}")
+    else:
+        print("- Phase-2 simulated recovery: not applicable (pure PSK)")
     print(f"- Comparison-only ephemeral state: {ephemeral_truth_file}")
     print(f"- Reproduction manifest: {manifest_file}")
     print(f"- Logs: {logs_dir}")
@@ -475,11 +624,15 @@ def capture_0rtt(
         "mode": "0rtt",
         "pcap_phase1": str(pcap_file_phase1),
         "pcap_phase2": str(pcap_file_phase2),
+        "pcap_phase3": str(pcap_file_phase3) if capture_grandchild else None,
         "keylog": str(keylog_file),
         "session_ticket": str(session_file),
         "server_ephemeral": str(server_ephem_json),
         "client_ephemeral": str(client_ephem_json),
         "simulated_recovery": str(recovery_file),
+        "phase2_simulated_recovery": (
+            str(phase2_recovery_file) if phase2_recovery_file else None
+        ),
         "ephemeral_ground_truth": str(ephemeral_truth_file),
         "manifest": str(manifest_file),
         "logs": str(logs_dir),

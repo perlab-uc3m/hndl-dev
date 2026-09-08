@@ -16,6 +16,7 @@ from .ssh.capture_ssh import capture_ssh
 from .tls12.capture_rsa import capture_tls12_rsa
 from .tls13.capture_0rtt import capture_0rtt as tls13_capture_0rtt
 from .tls13.capture_1rtt import capture_1rtt as tls13_capture_1rtt
+from .tls13.capture_external_psk import capture_external_psk
 
 
 def _capture_configured(config: ExperimentConfig, capture_root: Path) -> None:
@@ -39,12 +40,7 @@ def _capture_configured(config: ExperimentConfig, capture_root: Path) -> None:
     else:
         ensure_exec(config.openssl, "openssl")
         if config.protocol is Protocol.TLS13:
-            capture_function = (
-                tls13_capture_0rtt
-                if config.mode.value == "0rtt"
-                else tls13_capture_1rtt
-            )
-            capture_function(
+            arguments = (
                 config.openssl,
                 config.interface,
                 config.port,
@@ -52,6 +48,16 @@ def _capture_configured(config: ExperimentConfig, capture_root: Path) -> None:
                 capture_root,
                 config.verbose,
             )
+            if config.mode.value == "0rtt":
+                tls13_capture_0rtt(
+                    *arguments,
+                    config.tls13_resumption_kex,
+                    config.tls13_grandchild,
+                )
+            elif config.mode.value == "external-psk":
+                capture_external_psk(*arguments)
+            else:
+                tls13_capture_1rtt(*arguments)
         elif config.protocol is Protocol.QUIC:
             capture_quic(
                 config.openssl,
@@ -93,7 +99,7 @@ def _parser(repo_root: Path) -> argparse.ArgumentParser:
         default=Protocol.TLS13.value,
         help="protocol to capture (default: tls13)",
     )
-    parser.add_argument("--mode", help="tls13: 1rtt|0rtt; tls12: rsa")
+    parser.add_argument("--mode", help="tls13: 1rtt|0rtt|external-psk; tls12: rsa")
     parser.add_argument(
         "--openssl",
         default=str(repo_root / "openssl/.local/bin/openssl"),
@@ -121,6 +127,12 @@ def _parser(repo_root: Path) -> argparse.ArgumentParser:
         help="zero bytes to send before the SSH recovery marker",
     )
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--tls13-resumption-kex",
+        choices=("psk-dhe", "psk-only"),
+        default="psk-dhe",
+    )
+    parser.add_argument("--tls13-grandchild", action="store_true")
     return parser
 
 
@@ -142,6 +154,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             verbose=args.verbose,
             ssh_rekey_limit=args.ssh_rekey_limit,
             ssh_payload_bytes=args.ssh_payload_bytes,
+            tls13_resumption_kex=args.tls13_resumption_kex,
+            tls13_grandchild=args.tls13_grandchild,
         )
         capture_protocol(config)
         return 0

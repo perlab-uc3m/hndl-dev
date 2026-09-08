@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from archive_policy import ArchivePolicy, build_policy_archive
 from capture.capture import capture_protocol
 from decryptor.derive import recover_protocol
 from experiment import CaptureResult, ExperimentConfig, Protocol, RecoveryResult
@@ -55,7 +56,9 @@ def _legacy_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--protocol", "-p", choices=[protocol.value for protocol in Protocol]
     )
-    parser.add_argument("--mode", "-m", help="tls13: 1rtt|0rtt; tls12: rsa")
+    parser.add_argument(
+        "--mode", "-m", help="tls13: 1rtt|0rtt|external-psk; tls12: rsa"
+    )
     parser.add_argument("--port", type=int)
     parser.add_argument(
         "--data-root",
@@ -74,6 +77,17 @@ def _legacy_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decrypt-only", metavar="DIR")
     parser.add_argument("--ssh-rekey-limit", help="SSH RekeyLimit, e.g. 64K")
     parser.add_argument("--ssh-payload-bytes", type=int, default=0)
+    parser.add_argument(
+        "--tls13-resumption-kex",
+        choices=("psk-dhe", "psk-only"),
+        default="psk-dhe",
+        help="TLS 1.3 0-RTT child key exchange (default: psk-dhe)",
+    )
+    parser.add_argument(
+        "--tls13-grandchild",
+        action="store_true",
+        help="capture a third connection using a ticket issued by the child",
+    )
     return parser
 
 
@@ -92,10 +106,54 @@ def _recover_command(argv: Sequence[str]) -> int:
     return 1
 
 
+def _archive_command(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="hndl archive",
+        description="Build standalone raw, reassembled, or compact archives",
+    )
+    parser.add_argument("capture_dir", type=Path)
+    parser.add_argument(
+        "--policy",
+        choices=[policy.value for policy in ArchivePolicy] + ["all"],
+        default="all",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        help="parent directory for policy archives (default: beside the capture)",
+    )
+    args = parser.parse_args(argv)
+    capture = args.capture_dir.resolve()
+    output_root = (
+        args.output_root.resolve()
+        if args.output_root
+        else capture.parent / "policy-archives"
+    )
+    policies = (
+        list(ArchivePolicy)
+        if args.policy == "all"
+        else [ArchivePolicy.parse(args.policy)]
+    )
+    for policy in policies:
+        destination = output_root / f"{capture.name}-{policy.value}"
+        result = build_policy_archive(capture, destination, policy)
+        print(
+            f"{policy.value:11} {result.retained_bytes:10d} bytes "
+            f"({result.retention_ratio:.4f} of raw): {result.root}"
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(argv if argv is not None else sys.argv[1:])
     if arguments[:1] == ["recover"]:
         return _recover_command(arguments[1:])
+    if arguments[:1] == ["archive"]:
+        try:
+            return _archive_command(arguments[1:])
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Archive construction failed: {exc}", file=sys.stderr)
+            return 1
 
     args = _legacy_parser().parse_args(arguments)
     if args.decrypt_only:
@@ -123,6 +181,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             verbose=args.verbose,
             ssh_rekey_limit=args.ssh_rekey_limit,
             ssh_payload_bytes=args.ssh_payload_bytes,
+            tls13_resumption_kex=args.tls13_resumption_kex,
+            tls13_grandchild=args.tls13_grandchild,
         )
         capture = run_capture(config)
         if args.capture_only:

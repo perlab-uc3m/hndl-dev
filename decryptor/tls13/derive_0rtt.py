@@ -29,47 +29,9 @@ from ..io import (
     parse_server_keyshare_pub_from_sh,
     extract_decrypted_handshake_from_tshark,
     parse_new_session_ticket,
+    extract_psk_identity_from_client_hello,
     verify_tls_http_request,
 )
-
-
-def _extract_psk_ticket_from_ch(ch: bytes) -> bytes:
-    """Extract PSK ticket identity from ClientHello."""
-    pos = 4 + 2 + 32  # Skip handshake header + version + random
-    if pos >= len(ch):
-        return None
-
-    sess_id_len = ch[pos]
-    pos += 1 + sess_id_len
-    if pos + 2 > len(ch):
-        return None
-
-    cipher_suites_len = int.from_bytes(ch[pos : pos + 2], "big")
-    pos += 2 + cipher_suites_len
-    if pos >= len(ch):
-        return None
-
-    comp_len = ch[pos]
-    pos += 1 + comp_len
-    if pos + 2 > len(ch):
-        return None
-
-    ext_len = int.from_bytes(ch[pos : pos + 2], "big")
-    pos += 2
-    end = pos + ext_len
-
-    while pos + 4 <= end:
-        ext_type = int.from_bytes(ch[pos : pos + 2], "big")
-        ext_len_val = int.from_bytes(ch[pos + 2 : pos + 4], "big")
-        if ext_type == 41:  # PSK extension
-            psk_data = ch[pos + 4 : pos + 4 + ext_len_val]
-            if len(psk_data) >= 4:
-                id_len = int.from_bytes(psk_data[2:4], "big")
-                if len(psk_data) >= 4 + id_len:
-                    return psk_data[4 : 4 + id_len]
-        pos += 4 + ext_len_val
-
-    return None
 
 
 def derive_0rtt(
@@ -250,7 +212,7 @@ def derive_0rtt(
         return {"success": False, "error": "Could not extract ClientHello from phase 2"}
 
     # Match ticket identity
-    ticket_identity = _extract_psk_ticket_from_ch(ch2)
+    ticket_identity = extract_psk_identity_from_client_hello(ch2)
     if not ticket_identity:
         return {
             "success": False,
@@ -290,8 +252,9 @@ def derive_0rtt(
         )
 
     # Verify against OpenSSL keylog
-    ok, total = 0, 1
-    if paths.openssl_keylog_exists():
+    ground_truth_available = paths.openssl_keylog_exists()
+    ok, total = 0, 0
+    if ground_truth_available:
         keylog_truth = parse_tls13_handshake_secrets_from_keylog(
             paths.openssl_keylog, client_random2
         )
@@ -305,18 +268,32 @@ def derive_0rtt(
 
     plaintext_ok = verify_tls_http_request(pcap2, keylog_0rtt, port, debug)
 
-    status = "ALL MATCH" if ok == total else f"{ok}/{total} MATCH"
-    print(f"TLS 1.3 0-RTT keys: {status} ({total} secret)")
+    status = (
+        "ALL MATCH"
+        if ground_truth_available and ok == total == 1
+        else ("NOT PROVIDED" if not ground_truth_available else f"{ok}/{total} MATCH")
+    )
+    comparison = (
+        f"{total} compared secret" if ground_truth_available else "comparison omitted"
+    )
+    print(f"TLS 1.3 0-RTT keys: {status} ({comparison})")
     print(f"TLS 1.3 0-RTT plaintext: {'RECOVERED' if plaintext_ok else 'NOT VERIFIED'}")
     print(f"Output: {keylog_0rtt}")
 
     return {
-        "success": ok == total and total == 1 and plaintext_ok,
+        "success": (
+            (not ground_truth_available or (ok == total and total == 1))
+            and plaintext_ok
+        ),
         "keylog_path": str(keylog_0rtt),
-        "secrets": {"CLIENT_EARLY_TRAFFIC_SECRET": client_early_hex},
+        "secrets": {
+            "CLIENT_EARLY_TRAFFIC_SECRET": client_early_hex,
+            "RESUMPTION_PSK": psk.hex(),
+        },
         "validation": {
             "ground_truth_matches": ok,
             "ground_truth_expected": 1,
+            "ground_truth_available": ground_truth_available,
             "early_application_plaintext_recovered": plaintext_ok,
         },
     }

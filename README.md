@@ -43,6 +43,9 @@ python3 hndl.py --protocol ssh
 python3 hndl.py --protocol ssh --ssh-rekey-limit 64K --ssh-payload-bytes 300000
 python3 hndl.py --protocol tls13 --mode 1rtt
 python3 hndl.py --protocol tls13 --mode 0rtt
+python3 hndl.py --protocol tls13 --mode 0rtt --tls13-resumption-kex psk-only
+python3 hndl.py --protocol tls13 --mode 0rtt --tls13-grandchild
+python3 hndl.py --protocol tls13 --mode external-psk
 python3 hndl.py --protocol tls12 --mode rsa
 python3 hndl.py --protocol quic
 ```
@@ -52,6 +55,13 @@ issuance and use, disables its anti-replay rejection for this first-use test,
 and fails unless OpenSSL reports both a resumed TLS 1.3 session and accepted
 early data. This setting makes the reconstruction experiment deterministic; it
 is not a deployment recommendation.
+
+The optional PSK modes make the resumption dependencies executable. The
+`psk-only` child has no fresh DH contribution; the default `psk-dhe` child has
+one. `--tls13-grandchild` captures a third connection using a ticket issued by
+the child. `external-psk` generates an independently provisioned PSK and stores
+only its explicitly modeled later-compromise copy as a recovery input; the live
+command-line value is redacted from the manifest.
 
 The two phases can also run independently:
 
@@ -65,14 +75,33 @@ input, comparison-only state, and expected outputs from `manifest.json`.
 `--decrypt-only` remains available for compatibility; any supplied protocol,
 mode, or port is treated as an assertion and must agree with the manifest.
 
+Build standalone archive-policy experiments from a retained capture with:
+
+```bash
+python3 hndl.py archive data/2025-...-tls13-1rtt-capture --policy all
+python3 hndl.py recover data/policy-archives/2025-...-compact
+```
+
+Each generated archive contains the retained wire representation and declared
+future-recovery input (simulated asymmetric recovery or external-PSK
+compromise), but no SSL key log, SSH ground truth, or other endpoint secret. The
+`raw` policy retains the PCAP, `reassembled`
+retains ordered TCP payloads or UDP datagrams, and `compact` retains
+objective-specific protocol units visible at collection time. Their manifests
+record exact byte counts, source and implementation hashes, and the evidence
+boundary. The compact result is an achieved sufficient representation for the
+controlled application marker, not a proof of a universal minimum.
+
 For a development check of every supported mode, run:
 
 ```bash
 python3 scripts/smoke_test.py
+python3 scripts/smoke_test.py --archive-policies
 ```
 
 This performs fresh TLS 1.2 RSA, TLS 1.3 1-RTT, genuine TLS 1.3 0-RTT,
-QUIC, and forced-rekey SSH captures on dynamically selected loopback ports. It
+TLS 1.3 external-PSK, QUIC, and forced-rekey SSH captures on dynamically
+selected loopback ports. It
 requires the binaries from the setup section and working `dumpcap` permissions.
 The test fails on an incomplete pipeline, missing or empty evidence, packet
 drops, an SSH run with fewer than two authenticated transport epochs, or a
@@ -81,16 +110,65 @@ and removed after a complete pass; `--keep` retains them, and `--verbose`
 prints each pipeline's output. Each mode has a 90-second timeout by default;
 use `--timeout-seconds` on unusually slow systems.
 
+Run the complete four-case PSK causality matrix with one command:
+
+```bash
+python3 scripts/psk_matrix_test.py
+```
+
+It creates three live captures covering a pure-PSK child, a PSK-DHE child with
+early data and a ticket-using grandchild, and an independent external PSK. It
+checks positive recovery without endpoint ground truth and negative recovery
+when each required PSK, fresh DH output, or child ticket state is withheld or
+substituted. Use `--keep` or `--output-root` to retain the JSON evidence.
+
+Measure the defender-side cost of aggressive OpenSSH rekeying with:
+
+```bash
+./scripts/build_openssh.sh -p "$PWD/openssh-benchmark" -c -S -b -i
+python3 scripts/ssh_rekey_benchmark.py \
+  --rekey-limits default 64K --rtt-ms 0 20 80 --repetitions 5
+```
+
+The matched matrix runs bulk and interactive workloads against the pinned
+OpenSSH build and records client CPU, server CPU, throughput, first-byte time,
+interactive latency, transfer gaps, context switches, and observed rekey
+counts. It alternates limit order between repetitions and writes raw
+`samples.csv`, aggregated `summary.csv`, per-run logs, and a hash-bound
+`results.json` under `data/` by default. Nonzero nominal RTT uses a portable
+user-space TCP stream relay with half the requested delay in each direction;
+the relay applies delay per forwarded socket read and is explicitly recorded
+as an emulation, not presented as kernel-level `netem` measurement. This
+benchmark requires `/usr/bin/time` and a second, uninstrumented OpenSSH build,
+but not packet-capture permission: the capture build prints evidence on every
+exchange and would bias aggressive-rekey timing. The benchmark rejects those
+hooks by default;
+`--allow-instrumented --openssh-dir ./openssh/.local` exists only for short
+harness checks and produces results marked ineligible for paper timing.
+
+To rerun archive policies over retained captures with isolated negative
+controls and machine-readable JSON/CSV output, use:
+
+```bash
+python3 scripts/archive_policy_test.py data/<capture> [...] --output-root results --keep
+```
+
+For every policy this withholds all ground truth, authenticates the application
+marker, flips one retained bit, withholds the simulated recovery result, and
+checks that transient decoder adapters have been removed. For each compact
+archive it also corrupts retained ciphertext and recomputes the outer manifest
+hash; recovery must still fail at the protocol-authentication boundary.
+
 Output lands in `data/<timestamp>-<protocol>-capture/` with subdirectories
 `pcap/`, `keys/`, `logs/`, and `derived/`. TLS/QUIC derived secrets use NSS
 keylog format. SSH writes a JSON recovery record containing its reconstructed
 keys, authenticated-packet counts, oracle-release trace, and recovered channel
-data. Every capture writes `manifest.json` with exact commands, versions,
-machine details, the evidence boundary, and SHA-256 hashes of the relevant
-code, binaries, and evidence. Successful recovery also writes
-`derived/recovery_provenance.json`, binding the result to hashes of the source
-manifest, passive archive, simulated quantum output, comparison-only inputs,
-and recovery implementation.
+data. Every capture writes `manifest.json` with reproduction commands (secret
+arguments are redacted), versions, machine details, the evidence boundary, and
+SHA-256 hashes of the relevant code, binaries, and evidence. Successful
+recovery also writes `derived/recovery_provenance.json`, binding the result to
+hashes of the source manifest, passive archive, simulated quantum output,
+comparison-only inputs, and recovery implementation.
 
 ## How it works
 
@@ -103,10 +181,21 @@ protocol reconstruction test runnable on hosts where dumpcap lacks capture
 permission. Second, `decryptor/` consumes the simulated asymmetric-recovery
 output and the passive archive. Third, it reconstructs the protocol key
 schedule and proves success through authenticated application-data recovery.
-TLS and QUIC success requires all expected derived secrets to match the
-comparison-only key log and tshark to recover the known application request or
-response. A missing key log, handshake-only result, or absent plaintext marker
-is a failure rather than a vacuous success.
+TLS and QUIC success requires authenticated recovery of the known application
+request or response. When a comparison-only key log is present, every expected
+derived secret must also match it. Policy archives deliberately omit that log;
+successful authenticated plaintext is the independent recovery proof. A
+handshake-only result or absent plaintext marker remains a failure.
+
+Reassembled and compact archives are decoded through a short-lived synthetic
+PCAP envelope so the same protocol decoders test every policy. Synthetic link,
+IP, TCP, and UDP headers are never stored in the archive, are excluded from its
+byte count, and are deleted after recovery. Compact pruning is conservative:
+TLS 1.3 ciphertext is retained when its handshake/application role is not
+visible at collection time, QUIC retains bytes needed for header protection,
+and SSH retains direction-separated ciphertext streams because packet lengths
+are encrypted. Consequently compact output need not be smaller than
+reassembled output for every small capture.
 
 The public Python API uses `ExperimentConfig`, `CaptureResult`, and
 `RecoveryResult` from `experiment.py`. Capture and recovery dispatch directly
@@ -144,16 +233,17 @@ ground-truth file does not affect recovery.
 ```text
 hndl.py                 Main entrypoint
 experiment.py           Typed config/results and manifest validation
+archive_policy.py       Standalone raw/reassembled/compact archive policies
 pyproject.toml          Dependencies, console entry point, formatting/tests
 capture/
     capture.py          Capture CLI
-    tls13/              1-RTT and 0-RTT capture
+    tls13/              Full, resumed, grandchild and external-PSK capture
     tls12/              RSA key exchange capture
     quic/               QUIC (TLS 1.3 over UDP) capture
     ssh/                SSH (Curve25519) capture
 decryptor/
     derive.py           Derivation CLI
-    tls13/              derive_1rtt.py, derive_0rtt.py
+    tls13/              Full, early-data, resumed and external-PSK derivation
     tls12/              derive_rsa.py
     quic/               derive_quic.py
     ssh/                derive_ssh.py
@@ -161,8 +251,8 @@ decryptor/
     io/                 PCAP parsing, key material I/O
 analysis/               Cost models, mitigation experiments, figures
     results/            CSV data from experiments
-scripts/                Build scripts and the all-mode integration smoke test
-tests/                  Fast public manifest, dispatch, and cleanup tests
+scripts/                Builds, integration tests, and SSH rekey benchmark
+tests/                  Fast public crypto, manifest, archive and cleanup tests
 patches/                Source patches
 ```
 

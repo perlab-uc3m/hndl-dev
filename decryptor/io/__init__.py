@@ -17,8 +17,10 @@ from .pcap_parser import (
     parse_server_keyshare_pub_from_sh,
     extract_decrypted_handshake_from_tshark,
     parse_new_session_ticket,
+    extract_psk_identity_from_client_hello,
     parse_client_hello_without_binders,
     verify_tls_http_request,
+    verify_tls_http_response,
     verify_quic_stream_data,
 )
 from .key_material import (
@@ -52,8 +54,10 @@ __all__ = [
     "parse_server_keyshare_pub_from_sh",
     "extract_decrypted_handshake_from_tshark",
     "parse_new_session_ticket",
+    "extract_psk_identity_from_client_hello",
     "parse_client_hello_without_binders",
     "verify_tls_http_request",
+    "verify_tls_http_response",
     "verify_quic_stream_data",
     # key_material
     "read_json",

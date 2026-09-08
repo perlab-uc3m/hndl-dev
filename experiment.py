@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -12,6 +13,11 @@ from typing import Any, Mapping
 
 
 MANIFEST_SCHEMAS = {"hndl-run-manifest-v1", "hndl-ssh-run-manifest-v1"}
+SSH_REKEY_LIMIT_RE = re.compile(
+    r"^(?:default|none|[1-9][0-9]*(?:[KMG])?)"
+    r"(?:[ \t]+(?:none|[1-9][0-9]*(?:[smhdw])?))?$",
+    re.IGNORECASE,
+)
 
 
 class HNDLError(RuntimeError):
@@ -24,6 +30,19 @@ class ConfigurationError(HNDLError):
 
 class ManifestError(HNDLError):
     """Raised when capture metadata is absent, malformed, or unsafe."""
+
+
+def normalize_ssh_rekey_limit(value: str | None) -> str | None:
+    """Validate the OpenSSH ``RekeyLimit`` data/time syntax."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not SSH_REKEY_LIMIT_RE.fullmatch(normalized):
+        raise ConfigurationError(
+            "invalid SSH RekeyLimit; use default, none, or a size such as "
+            "64K with an optional time such as 1h"
+        )
+    return normalized
 
 
 def require_tool(name: str) -> None:
@@ -72,6 +91,7 @@ class Mode(str, Enum):
     RSA = "rsa"
     ONE_RTT = "1rtt"
     ZERO_RTT = "0rtt"
+    EXTERNAL_PSK = "external-psk"
 
     @classmethod
     def parse(cls, value: str | Mode | None) -> Mode | None:
@@ -85,6 +105,8 @@ class Mode(str, Enum):
             "full1-rtthandshake": cls.ONE_RTT,
             "0rtt": cls.ZERO_RTT,
             "0-rttresumption": cls.ZERO_RTT,
+            "external-psk": cls.EXTERNAL_PSK,
+            "externalpsk": cls.EXTERNAL_PSK,
         }
         try:
             return aliases[normalized]
@@ -150,6 +172,8 @@ class ExperimentConfig:
     verbose: bool = False
     ssh_rekey_limit: str | None = None
     ssh_payload_bytes: int = 0
+    tls13_resumption_kex: str = "psk-dhe"
+    tls13_grandchild: bool = False
 
     @classmethod
     def create(
@@ -171,8 +195,9 @@ class ExperimentConfig:
         if parsed_protocol is Protocol.TLS13 and parsed_mode not in {
             Mode.ONE_RTT,
             Mode.ZERO_RTT,
+            Mode.EXTERNAL_PSK,
         }:
-            raise ConfigurationError("TLS 1.3 mode must be 1rtt or 0rtt")
+            raise ConfigurationError("TLS 1.3 mode must be 1rtt, 0rtt, or external-psk")
         if parsed_protocol in {Protocol.QUIC, Protocol.SSH} and parsed_mode is not None:
             raise ConfigurationError(f"{parsed_protocol.value} does not accept a mode")
         selected_port = (
@@ -187,17 +212,43 @@ class ExperimentConfig:
         payload_bytes = int(kwargs.get("ssh_payload_bytes", 0))
         if payload_bytes < 0:
             raise ConfigurationError("SSH payload size cannot be negative")
+        rekey_limit = normalize_ssh_rekey_limit(kwargs.get("ssh_rekey_limit"))
+        if parsed_protocol is not Protocol.SSH and (payload_bytes or rekey_limit):
+            raise ConfigurationError(
+                "SSH payload and RekeyLimit options require the SSH protocol"
+            )
         group = str(kwargs.get("group", "X25519"))
         if (
             parsed_protocol in {Protocol.TLS13, Protocol.QUIC}
             and group.lower() != "x25519"
         ):
             raise ConfigurationError("recovery currently supports only X25519")
+        resumption_kex = str(kwargs.get("tls13_resumption_kex", "psk-dhe")).lower()
+        if resumption_kex not in {"psk-dhe", "psk-only"}:
+            raise ConfigurationError(
+                "TLS 1.3 resumption key exchange must be psk-dhe or psk-only"
+            )
+        if resumption_kex != "psk-dhe" and not (
+            parsed_protocol is Protocol.TLS13 and parsed_mode is Mode.ZERO_RTT
+        ):
+            raise ConfigurationError(
+                "psk-only is supported only for the TLS 1.3 0-RTT experiment"
+            )
+        grandchild = bool(kwargs.get("tls13_grandchild", False))
+        if grandchild and not (
+            parsed_protocol is Protocol.TLS13 and parsed_mode is Mode.ZERO_RTT
+        ):
+            raise ConfigurationError(
+                "grandchild capture is supported only for TLS 1.3 0-RTT"
+            )
         kwargs["protocol"] = parsed_protocol
         kwargs["mode"] = parsed_mode
         kwargs["port"] = selected_port
         kwargs["group"] = group
         kwargs["ssh_payload_bytes"] = payload_bytes
+        kwargs["ssh_rekey_limit"] = rekey_limit
+        kwargs["tls13_resumption_kex"] = resumption_kex
+        kwargs["tls13_grandchild"] = grandchild
         kwargs["data_root"] = Path(kwargs.get("data_root", "data")).resolve()
         kwargs["openssl"] = Path(
             kwargs.get("openssl", "openssl/.local/bin/openssl")
@@ -352,6 +403,19 @@ def recovery_spec(
             ("keys/sslkeylog.log",),
             ("derived/nss_0rtt.keylog", "derived/recovery_provenance.json"),
         )
+    if protocol is Protocol.TLS13 and mode is Mode.EXTERNAL_PSK:
+        return RecoverySpec(
+            protocol,
+            mode,
+            port,
+            ("pcap/tls13_external_psk.pcapng",),
+            "keys/simulated_external_psk.json",
+            ("keys/sslkeylog.log",),
+            (
+                "derived/nss_external_psk.keylog",
+                "derived/recovery_provenance.json",
+            ),
+        )
     if protocol is Protocol.TLS13:
         return RecoverySpec(
             protocol,
@@ -504,6 +568,7 @@ class RecoveryResult:
             result.get("expected_plaintext_recovered")
             or validation.get("application_plaintext_recovered")
             or validation.get("early_application_plaintext_recovered")
+            or validation.get("application_response_authenticated")
         )
         return cls(
             bool(result.get("success")),

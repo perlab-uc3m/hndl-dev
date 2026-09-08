@@ -11,6 +11,7 @@ from experiment import (
     Mode,
     Protocol,
     RunManifest,
+    normalize_ssh_rekey_limit,
     recovery_spec,
     sha256_file,
 )
@@ -40,6 +41,26 @@ class ExperimentConfigTests(unittest.TestCase):
     def test_invalid_combinations_fail_before_capture(self):
         with self.assertRaises(ConfigurationError):
             ExperimentConfig.create("tls12", "0rtt")
+        with self.assertRaises(ConfigurationError):
+            ExperimentConfig.create("quic", tls13_resumption_kex="psk-only")
+        with self.assertRaises(ConfigurationError):
+            ExperimentConfig.create("tls13", "1rtt", tls13_grandchild=True)
+        with self.assertRaises(ConfigurationError):
+            ExperimentConfig.create("tls13", ssh_rekey_limit="64K")
+        with self.assertRaises(ConfigurationError):
+            ExperimentConfig.create("ssh", ssh_rekey_limit="64K\nLogLevel QUIET")
+
+    def test_ssh_rekey_limit_validation(self):
+        self.assertEqual(normalize_ssh_rekey_limit("64K 1h"), "64K 1h")
+        self.assertEqual(normalize_ssh_rekey_limit(" none "), "none")
+
+    def test_tls13_psk_modes(self):
+        pure = ExperimentConfig.create("tls13", "0rtt", tls13_resumption_kex="psk-only")
+        external = ExperimentConfig.create("tls13", "external-psk")
+        self.assertEqual(pure.tls13_resumption_kex, "psk-only")
+        self.assertEqual(external.mode, Mode.EXTERNAL_PSK)
+        spec = recovery_spec("tls13", "external-psk", 44443)
+        self.assertEqual(spec.simulated_recovery, "keys/simulated_external_psk.json")
         with self.assertRaises(ConfigurationError):
             ExperimentConfig.create("quic", "1rtt")
         with self.assertRaises(ConfigurationError):

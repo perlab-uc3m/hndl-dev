@@ -153,7 +153,11 @@ def write_run_manifest(
 
 
 def persist_recovery_material(
-    keys_dir: Path, endpoint_state: dict, recovered_role: str = "server"
+    keys_dir: Path,
+    endpoint_state: dict,
+    recovered_role: str = "server",
+    oracle_name: str = "simulated_quantum_output.json",
+    truth_name: str = "openssl_ephemeral_ground_truth.json",
 ) -> tuple[Path, Path]:
     """Separate simulated attacker output from comparison-only endpoint state."""
     recovered = endpoint_state.get(recovered_role, {})
@@ -164,8 +168,8 @@ def persist_recovery_material(
             f"instrumented {recovered_role} did not export a complete ephemeral key"
         )
 
-    oracle_path = keys_dir / "simulated_quantum_output.json"
-    truth_path = keys_dir / "openssl_ephemeral_ground_truth.json"
+    oracle_path = keys_dir / oracle_name
+    truth_path = keys_dir / truth_name
     oracle_path.write_text(
         json.dumps(
             {
