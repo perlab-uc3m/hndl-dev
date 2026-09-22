@@ -85,24 +85,24 @@ def _validate_profile(chunks: list[Chunk], profile: ProtocolProfile) -> None:
         )
 
 
-def compact(
-    capture_dir: Path, mode: str, port: int, profile: ProtocolProfile
-):
+def compact(capture_dir: Path, mode: str, port: int, profile: ProtocolProfile):
     if mode != "default":
         raise ValueError("SSH uses mode 'default'")
     pcaps = resolve_pcaps(capture_dir, PCAP_NAMES)
     _validate_profile(extract_tcp_chunks(pcaps[0], port), profile)
-    layout, opaque, measurements = compact_chunk_pcaps(
-        pcaps, port, "tcp"
+    layout, opaque, measurements = compact_chunk_pcaps(pcaps, port, "tcp")
+    return (
+        layout,
+        opaque,
+        {
+            "policy": "ordered-directional-ciphertext-stream",
+            "encrypted_packet_boundaries": "not-assumed",
+            "future_recovery_input": "current decoder imports endpoint K/H/session_id and remains an explicit incomplete evidence boundary",
+            "authenticated_passive_recovery": False,
+            "profile_validation": "KEX and both directional ciphers checked from clear KEXINIT",
+            "captures": measurements,
+        },
     )
-    return layout, opaque, {
-        "policy": "ordered-directional-ciphertext-stream",
-        "encrypted_packet_boundaries": "not-assumed",
-        "future_recovery_input": "current decoder imports endpoint K/H/session_id and remains an explicit incomplete evidence boundary",
-        "authenticated_passive_recovery": False,
-        "profile_validation": "KEX and both directional ciphers checked from clear KEXINIT",
-        "captures": measurements,
-    }
 
 
 def materialize(

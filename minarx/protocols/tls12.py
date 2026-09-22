@@ -23,11 +23,10 @@ RECOVERY_FILES_BY_MODE = {}
 OPTIONAL_RECOVERY_FILES = ["sslkeylog.log"]
 
 
-def compact(
-    capture_dir: Path, mode: str, port: int, profile: ProtocolProfile
-):
+def compact(capture_dir: Path, mode: str, port: int, profile: ProtocolProfile):
     if mode != "rsa":
         raise ValueError("TLS 1.2 compaction currently supports rsa mode")
+
     def validate(chunks, _index):
         parameters = tls_hello_parameters(chunks)
         if parameters.get("cipher_suite_id") != profile.cipher_suite_id:
@@ -44,11 +43,15 @@ def compact(
     layout, opaque, measurements = compact_tls_pcaps(
         resolve_pcaps(capture_dir, PCAP_NAMES), port, validate
     )
-    return layout, opaque, {
-        "policy": "tls-records",
-        "future_recovery_input": "RSA private key corresponding to the archived certificate public key",
-        "captures": measurements,
-    }
+    return (
+        layout,
+        opaque,
+        {
+            "policy": "tls-records",
+            "future_recovery_input": "RSA private key corresponding to the archived certificate public key",
+            "captures": measurements,
+        },
+    )
 
 
 def materialize(

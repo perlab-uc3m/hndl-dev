@@ -18,9 +18,7 @@ RECOVERY_FILES_BY_MODE = {}
 OPTIONAL_RECOVERY_FILES = ["sslkeylog.log"]
 
 
-def compact(
-    capture_dir: Path, mode: str, port: int, profile: ProtocolProfile
-):
+def compact(capture_dir: Path, mode: str, port: int, profile: ProtocolProfile):
     if mode != "default":
         raise ValueError("QUIC uses mode 'default'")
     pcaps = resolve_pcaps(capture_dir, PCAP_NAMES)
@@ -48,14 +46,18 @@ def compact(
         # datagrams, including Version Negotiation packets whose fixed bit is 0.
         chunk_filter=lambda chunk: chunk.data != b"\x00",
     )
-    return layout, opaque, {
-        "policy": "complete-quic-datagrams",
-        "authentication_tags": "retained",
-        "header_protection_samples": "retained",
-        "future_recovery_input": "client X25519 private scalar; peer public share is reconstructed from Initial packets",
-        "profile_validation": "QUIC version and public-Initial TLS ciphersuite checked",
-        "captures": measurements,
-    }
+    return (
+        layout,
+        opaque,
+        {
+            "policy": "complete-quic-datagrams",
+            "authentication_tags": "retained",
+            "header_protection_samples": "retained",
+            "future_recovery_input": "client X25519 private scalar; peer public share is reconstructed from Initial packets",
+            "profile_validation": "QUIC version and public-Initial TLS ciphersuite checked",
+            "captures": measurements,
+        },
+    )
 
 
 def materialize(

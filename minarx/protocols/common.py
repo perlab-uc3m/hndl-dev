@@ -82,15 +82,19 @@ def _encode_tls_records(chunks: list[Chunk]) -> tuple[bytes, bytes, dict]:
             handshake += len(fragment)
         if content_type == 20:
             encryption_active[direction] = True
-    return bytes(out), bytes(opaque), {
-        "record_count": len(records),
-        "record_header_bytes_removed": 5 * len(records),
-        "protected_record_payload_bytes": protected,
-        "opaque_bytes": protected,
-        "clear_protocol_bytes": clear_protocol,
-        "clear_handshake_payload_bytes": handshake,
-        "transport_payload_bytes": sum(len(chunk.data) for chunk in chunks),
-    }
+    return (
+        bytes(out),
+        bytes(opaque),
+        {
+            "record_count": len(records),
+            "record_header_bytes_removed": 5 * len(records),
+            "protected_record_payload_bytes": protected,
+            "opaque_bytes": protected,
+            "clear_protocol_bytes": clear_protocol,
+            "clear_handshake_payload_bytes": handshake,
+            "transport_payload_bytes": sum(len(chunk.data) for chunk in chunks),
+        },
+    )
 
 
 def _decode_tls_records(layout: bytes, opaque_reader: Reader) -> list[Chunk]:
@@ -282,9 +286,7 @@ def tls_hello_parameters(chunks: list[Chunk]) -> dict:
     }
     client_key_share = client_extensions.get(51)
     if client_key_share and len(client_key_share) >= 4:
-        result["client_key_share_group"] = int.from_bytes(
-            client_key_share[2:4], "big"
-        )
+        result["client_key_share_group"] = int.from_bytes(client_key_share[2:4], "big")
     if server_hello is not None:
         position = 4 + 2 + 32
         if position >= len(server_hello):

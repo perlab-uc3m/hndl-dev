@@ -29,13 +29,10 @@ RECOVERY_FILES_BY_MODE = {
 OPTIONAL_RECOVERY_FILES = ["sslkeylog.log"]
 
 
-def compact(
-    capture_dir: Path, mode: str, port: int, profile: ProtocolProfile
-):
+def compact(capture_dir: Path, mode: str, port: int, profile: ProtocolProfile):
     if mode not in NAMES:
-        raise ValueError(
-            "TLS 1.3 compaction mode must be 1rtt, 0rtt, or external-psk"
-        )
+        raise ValueError("TLS 1.3 compaction mode must be 1rtt, 0rtt, or external-psk")
+
     def validate(chunks, index):
         parameters = tls_hello_parameters(chunks)
         if parameters.get("cipher_suite_id") != profile.cipher_suite_id:
@@ -52,8 +49,7 @@ def compact(
         if parameters.get("early_data_offered", False) != expected_early_data:
             raise ValueError("trace early-data offer does not match MinARX profile")
         expected_keyshare = mode == "1rtt" or (
-            mode == "0rtt"
-            and (index == 0 or profile.resumption == "ticket-psk-dhe")
+            mode == "0rtt" and (index == 0 or profile.resumption == "ticket-psk-dhe")
         )
         observed_keyshare = parameters.get("server_key_share_group")
         if expected_keyshare and observed_keyshare != 0x001D:
@@ -64,12 +60,16 @@ def compact(
     layout, opaque, measurements = compact_tls_pcaps(
         resolve_pcaps(capture_dir, NAMES[mode]), port, validate
     )
-    return layout, opaque, {
-        "policy": "tls-records-complete-transcript",
-        "hello_retry_request": "outside-exercised-matrix",
-        "future_recovery_input": "server X25519 private scalar; peer public share is reconstructed from the archive",
-        "captures": measurements,
-    }
+    return (
+        layout,
+        opaque,
+        {
+            "policy": "tls-records-complete-transcript",
+            "hello_retry_request": "outside-exercised-matrix",
+            "future_recovery_input": "server X25519 private scalar; peer public share is reconstructed from the archive",
+            "captures": measurements,
+        },
+    )
 
 
 def materialize(

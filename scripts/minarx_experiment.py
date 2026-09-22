@@ -49,8 +49,7 @@ class MinArxOutcome:
             self.recovery_success
             and self.plaintext_authenticated
             and self.reference_keylog_absent
-            and self.total_saved_bytes
-            == self.raw_capture_bytes - self.minarx_bytes
+            and self.total_saved_bytes == self.raw_capture_bytes - self.minarx_bytes
         )
 
 
@@ -121,9 +120,7 @@ def _run(
     protocol = source.recovery.protocol.value
     mode = source.recovery.mode.value if source.recovery.mode else "default"
     port = source.recovery.port
-    profile = _select_profile(
-        capture, protocol, mode, port, requested_profile
-    )
+    profile = _select_profile(capture, protocol, mode, port, requested_profile)
     archive = output_root / f"{capture.name}-{profile}.minarx"
     try:
         stats = compact_capture(

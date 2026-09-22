@@ -39,7 +39,9 @@ def rows(paths: list[Path]) -> list[dict]:
                 "pruned": int(item["deterministic_pruning_bytes"]),
                 "entropy": int(item["layout_entropy_saving_bytes"]),
                 "saved": saved,
-                "percent": 100 * saved / structural_baseline if structural_baseline else 0.0,
+                "percent": (
+                    100 * saved / structural_baseline if structural_baseline else 0.0
+                ),
             }
         )
     return result

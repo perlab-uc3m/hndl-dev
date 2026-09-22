@@ -97,8 +97,7 @@ def compact_capture(
         - precompression_structural_bytes,
         "net_saving_before_layout_compression_bytes": raw_bytes
         - (opaque_bytes + fixed_container_bytes + len(layout)),
-        "layout_entropy_saving_bytes": len(layout)
-        - container.stored_layout_bytes,
+        "layout_entropy_saving_bytes": len(layout) - container.stored_layout_bytes,
         "total_structural_saving_bytes": structural_baseline_bytes
         - stored_structural_bytes,
     }
@@ -170,7 +169,10 @@ def materialize_archive(path: Path, output_dir: Path) -> dict:
         codec.materialize(
             container.layout,
             container.opaque,
-            {"mode": container.profile.mode, "profile": container.profile.to_metadata()},
+            {
+                "mode": container.profile.mode,
+                "profile": container.profile.to_metadata(),
+            },
             output_dir,
             port,
         )

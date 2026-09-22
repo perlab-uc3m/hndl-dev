@@ -1,22 +1,22 @@
 {
   "schema": "hndl-minarx-paper-experiment-v1",
-  "created_utc": "2026-09-22T10:24:35.473263+00:00",
+  "created_utc": "2026-09-22T13:31:52.355811+00:00",
   "opaque_bytes_entropy_coded": false,
   "fixed_container_bytes": 66,
   "success_criterion": "future recovery authenticates application plaintext without a reference key log",
   "implementation_sha256": {
     "archive_policy.py": "d8b6680f63d3de6d9f293b6b9258ff823618b45beb096fbc616ac31b134bfd32",
-    "minarx/archive.py": "f3e7c0e84bc308f1bfdbff8044ae2ac44559d8210678ee1e209331bb3783908c",
+    "minarx/archive.py": "54e061506b3f37aefc4781ad25e9aba8668899dd1c720b79b2f391194fb1d29d",
     "minarx/format.py": "9d3540dea289d946d3d7b6bd70f915f5da5dc3bca12abd1d04b4114e38b74e7f",
     "minarx/pcap.py": "233dbf53fa0e0315953bab417d9bf09efed24eeb8bf60d6caa8ae1c6ab6b4f0b",
-    "minarx/profiles.py": "4daf05a5b56bf5bc1e5091584e6ad10aa67784060a20c8a7a40c1bc5bd9460f2",
-    "minarx/protocols/common.py": "15051b51d118cd911116e967c845b1b1810521dc5eb44b08ea66489cbb2f9203",
-    "minarx/protocols/tls12.py": "ff1433c840c693a9cd75b3ac577133431d843533e7d0c3c72af2b60b13932957",
-    "minarx/protocols/tls13.py": "7b9ebf0eaceae6c85247b3ba40612b08fe72e468b4e1a0f59398366809797f62",
-    "minarx/protocols/quic.py": "1e90360c42b0b99fe302d0fd463c921b6fd028aa2a07286e788a985b52b7615e",
-    "minarx/protocols/ssh.py": "d3dde6dcd4b21b32f561602c17993f582350631cb00e6019688700a3102c394a",
-    "decryptor/derive.py": "3923d7a40d687d76b2e126abf09144d3ab153200dbecc0b99241a5ec8cd2df1b",
-    "scripts/minarx_experiment.py": "f53140b3af61848fe908877aa9b5d1b54d1369d472f93ddff0d2bca1cb364f25"
+    "minarx/profiles.py": "5df48929b77db59e3282c60c76b5786924d0b6b76359adcc3ee36ae6bb7d3938",
+    "minarx/protocols/common.py": "e6bee8a2ce8718bd8244b91058d09ee9d13b2a146b21128181ca28a804023439",
+    "minarx/protocols/tls12.py": "f121962a8cc94075ff4db02ad5a8b991adfd284609b4b1abd4e8d91b419fc69e",
+    "minarx/protocols/tls13.py": "088008660fc77224a187e23fbba093cfbff92cb53d704b07e1ee9c7a77ac1af8",
+    "minarx/protocols/quic.py": "40127813373f5479a5a7048a30b7e5a6fb0360e351f298ffc528cffe353c7e38",
+    "minarx/protocols/ssh.py": "736c0a2ce0fa58a3b688536f54bb8da73c296f32aa417a7b36167b3a932b0e21",
+    "decryptor/derive.py": "ac71b5e66758ff18f2dc31c0f23a5129940cefb39642f4683e7d9671c065482b",
+    "scripts/minarx_experiment.py": "ed6d3d943f5aaf0a99a9c5ef7fd9f1f82c1140d34ebf473898d5a684cfd433a0"
   },
   "outcomes": [
     {

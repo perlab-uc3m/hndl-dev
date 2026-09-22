@@ -276,7 +276,9 @@ def resolve_profile(
         try:
             return PROFILES[DEFAULT_PROFILE[(protocol, mode)]]
         except KeyError as exc:
-            raise ValueError(f"no default MinARX profile for {protocol}/{mode}") from exc
+            raise ValueError(
+                f"no default MinARX profile for {protocol}/{mode}"
+            ) from exc
     if isinstance(profile, str):
         try:
             selected = PROFILES[profile]

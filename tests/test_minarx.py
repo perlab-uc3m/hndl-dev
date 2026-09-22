@@ -23,7 +23,12 @@ from minarx.profiles import PROFILES
 
 
 def _record(content_type: int, fragment: bytes) -> bytes:
-    return bytes([content_type]) + b"\x03\x03" + len(fragment).to_bytes(2, "big") + fragment
+    return (
+        bytes([content_type])
+        + b"\x03\x03"
+        + len(fragment).to_bytes(2, "big")
+        + fragment
+    )
 
 
 def _handshake(message_type: int, body: bytes) -> bytes:
@@ -157,7 +162,9 @@ def _ssh_chunks(
 ) -> list[Chunk]:
     return [
         Chunk(0, b"SSH-2.0-test-client\r\n" + _ssh_kexinit(cipher, True) + client_tail),
-        Chunk(1, b"SSH-2.0-test-server\r\n" + _ssh_kexinit(cipher, False) + server_tail),
+        Chunk(
+            1, b"SSH-2.0-test-server\r\n" + _ssh_kexinit(cipher, False) + server_tail
+        ),
     ]
 
 
@@ -185,7 +192,9 @@ def _tls13_chunks(
 
 
 class MinArxTests(unittest.TestCase):
-    def _capture(self, root: Path, filename: str, chunks: list[Chunk], transport: str, port: int) -> Path:
+    def _capture(
+        self, root: Path, filename: str, chunks: list[Chunk], transport: str, port: int
+    ) -> Path:
         capture = root / "capture"
         (capture / "pcap").mkdir(parents=True, exist_ok=True)
         write_pcap(capture / "pcap" / filename, chunks, transport, port)
@@ -237,9 +246,7 @@ class MinArxTests(unittest.TestCase):
         elif profile.protocol == "tls13":
             write_pcap(
                 capture / "pcap" / "tls13_external_psk.pcapng",
-                _tls13_chunks(
-                    profile.cipher_suite_id, resumed=True, key_share=False
-                ),
+                _tls13_chunks(profile.cipher_suite_id, resumed=True, key_share=False),
                 "tcp",
                 port,
             )
@@ -293,7 +300,8 @@ class MinArxTests(unittest.TestCase):
                     self.assertFalse(stats["opaque_bytes_entropy_coded"])
                     self.assertEqual(
                         stats["archive_bytes"],
-                        stats["opaque_bytes"] + stats["structural_bytes_after_entropy_coding"],
+                        stats["opaque_bytes"]
+                        + stats["structural_bytes_after_entropy_coding"],
                     )
                     self.assertEqual(
                         stats["total_structural_saving_bytes"],
@@ -308,10 +316,18 @@ class MinArxTests(unittest.TestCase):
                     for source in stats["captures"]:
                         source_path = capture / "pcap" / source["source_name"]
                         output_path = expanded / "pcap" / source["source_name"]
-                        extractor = extract_udp_datagrams if profile.protocol == "quic" else extract_tcp_chunks
-                        self.assertEqual(extractor(source_path, port), extractor(output_path, port))
+                        extractor = (
+                            extract_udp_datagrams
+                            if profile.protocol == "quic"
+                            else extract_tcp_chunks
+                        )
+                        self.assertEqual(
+                            extractor(source_path, port), extractor(output_path, port)
+                        )
                     seen_categories.add(profile.category)
-            self.assertEqual(seen_categories, {profile.category for profile in PROFILES.values()})
+            self.assertEqual(
+                seen_categories, {profile.category for profile in PROFILES.values()}
+            )
 
     def test_tls13_archive_reconstructs_keyshare_and_shared_secret(self):
         client_private = x25519.X25519PrivateKey.generate()
@@ -333,8 +349,14 @@ class MinArxTests(unittest.TestCase):
             parsed_client, parsed_server = extract_tls_hello_pair(
                 expanded / "pcap" / "tls13_1rtt.pcapng", 44443
             )
-            self.assertEqual(parse_client_keyshare_pub_from_ch(parsed_client), _public_bytes(client_private))
-            self.assertEqual(parse_server_keyshare_pub_from_sh(parsed_server), _public_bytes(server_private))
+            self.assertEqual(
+                parse_client_keyshare_pub_from_ch(parsed_client),
+                _public_bytes(client_private),
+            )
+            self.assertEqual(
+                parse_server_keyshare_pub_from_sh(parsed_server),
+                _public_bytes(server_private),
+            )
             recovered = compute_shared_secret_from_priv_and_peer(
                 client_private.private_bytes(
                     serialization.Encoding.Raw,
@@ -344,7 +366,9 @@ class MinArxTests(unittest.TestCase):
                 parse_server_keyshare_pub_from_sh(parsed_server).hex(),
                 "x25519",
             )
-            self.assertEqual(recovered, client_private.exchange(server_private.public_key()))
+            self.assertEqual(
+                recovered, client_private.exchange(server_private.public_key())
+            )
             self.assertLess(stats["archive_bytes"], stats["raw_capture_bytes"])
 
     def test_opaque_payload_entropy_cannot_change_size_accounting(self):
@@ -387,7 +411,11 @@ class MinArxTests(unittest.TestCase):
         clear_certificate = _handshake(11, b"C" * 4096)
         chunks = [
             Chunk(0, _record(22, client_hello)),
-            Chunk(1, _record(22, server_hello + clear_certificate) + _record(23, os.urandom(2048))),
+            Chunk(
+                1,
+                _record(22, server_hello + clear_certificate)
+                + _record(23, os.urandom(2048)),
+            ),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -395,7 +423,9 @@ class MinArxTests(unittest.TestCase):
             plain_path, auto_path = root / "plain.minarx", root / "auto.minarx"
             plain = compact_capture(capture, plain_path, "tls12", compression="none")
             auto = compact_capture(capture, auto_path, "tls12", compression="auto")
-            plain_container, auto_container = read_container(plain_path), read_container(auto_path)
+            plain_container, auto_container = read_container(
+                plain_path
+            ), read_container(auto_path)
             self.assertEqual(plain_container.opaque, auto_container.opaque)
             self.assertEqual(plain_container.layout, auto_container.layout)
             self.assertEqual(
@@ -407,9 +437,7 @@ class MinArxTests(unittest.TestCase):
             for compression in ("none", "deflate", "lzma", "auto"):
                 with self.subTest(compression=compression):
                     path = root / f"{compression}.minarx"
-                    compact_capture(
-                        capture, path, "tls12", compression=compression
-                    )
+                    compact_capture(capture, path, "tls12", compression=compression)
                     container = read_container(path)
                     expected = (
                         compression
@@ -433,13 +461,14 @@ class MinArxTests(unittest.TestCase):
                     profile="tls13-full-aes256gcm",
                 )
 
-            quic_capture, quic_port = self._profile_capture(
-                root, "quic-v1-aes128gcm"
-            )
-            with patch(
-                "minarx.protocols.quic.extract_quic_cipher_suites",
-                return_value={0x1301},
-            ), self.assertRaisesRegex(ArchiveError, "does not select profile"):
+            quic_capture, quic_port = self._profile_capture(root, "quic-v1-aes128gcm")
+            with (
+                patch(
+                    "minarx.protocols.quic.extract_quic_cipher_suites",
+                    return_value={0x1301},
+                ),
+                self.assertRaisesRegex(ArchiveError, "does not select profile"),
+            ):
                 compact_capture(
                     quic_capture,
                     root / "wrong-quic.minarx",
@@ -485,9 +514,7 @@ class MinArxTests(unittest.TestCase):
                 json.dumps({"priv": "11" * 32})
             )
 
-            def fake_derive(
-                capture_dir, protocol=None, mode=None, debug=False
-            ):
+            def fake_derive(capture_dir, protocol=None, mode=None, debug=False):
                 materialized = Path(capture_dir)
                 self.assertTrue((materialized / "pcap" / "tls13_1rtt.pcapng").is_file())
                 self.assertTrue(
@@ -501,7 +528,9 @@ class MinArxTests(unittest.TestCase):
             output = root / "output"
             derive_module = importlib.import_module("decryptor.derive")
             with patch.object(derive_module, "derive", side_effect=fake_derive):
-                result = derive_compacted(str(archive), str(recovery), output_dir=str(output))
+                result = derive_compacted(
+                    str(archive), str(recovery), output_dir=str(output)
+                )
             self.assertTrue(result["success"])
             self.assertTrue(result["compacted_input"])
             self.assertEqual((output / "proof.txt").read_text(), "derived")

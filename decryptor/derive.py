@@ -405,7 +405,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.compacted:
         if not args.recovery_dir:
-            print("Recovery failed: --compacted requires --recovery-dir", file=sys.stderr)
+            print(
+                "Recovery failed: --compacted requires --recovery-dir", file=sys.stderr
+            )
             return 2
         result = derive_compacted(
             args.compacted,

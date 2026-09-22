@@ -10,9 +10,7 @@ from .profiles import PROFILES, profiles_by_category
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Protocol-aware MinARX archives"
-    )
+    parser = argparse.ArgumentParser(description="Protocol-aware MinARX archives")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     compact = subparsers.add_parser("compact", help="compact a capture directory")
