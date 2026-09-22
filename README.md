@@ -92,6 +92,35 @@ record exact byte counts, source and implementation hashes, and the evidence
 boundary. The compact result is an achieved sufficient representation for the
 controlled application marker, not a proof of a universal minimum.
 
+MinARX is the stricter protocol-aware minimal archive used for the paper's
+byte table. It separates a compressible protocol-layout region from verbatim
+protected/application bytes, reconstructs decoder-compatible PCAPs, and keeps
+future-recovery material outside the archive and its byte count:
+
+```bash
+python3 -m minarx profiles
+python3 -m minarx compact --capture-dir data/<capture> \
+  --protocol tls13 --mode 1rtt --profile tls13-full-aes256gcm \
+  --output data/session.minarx
+python3 -m decryptor.derive --compacted data/session.minarx \
+  --recovery-dir data/<capture>
+```
+
+Run the paper experiment over fresh, manifest-bound captures with:
+
+```bash
+python3 scripts/minarx_experiment.py data/<capture> [...] \
+  --output-root data/minarx-results
+```
+
+The command fails unless every reconstructed archive authenticates the
+controlled application marker without a comparison key log. It writes
+hash-bound JSON/CSV with raw capture, transport, opaque, layout, compression,
+and final archive byte counts. The checked reference run is
+`analysis/results/minarx_live_2026-09-22.{json,csv}`. Format semantics and the
+reason savings are trace-shape dependent are documented in
+`docs/minarx_format.md`.
+
 For a development check of every supported mode, run:
 
 ```bash

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -261,9 +263,122 @@ def derive(
     return {"success": False, "error": result.error}
 
 
+def _minarx_recovery_source(recovery_dir: Path, filename: str) -> Path:
+    """Resolve one declared future-recovery file without copying ground truth."""
+    direct = recovery_dir / filename
+    nested = recovery_dir / "keys" / filename
+    return direct if direct.is_file() else nested
+
+
+def derive_compacted(
+    archive_path: str,
+    recovery_dir: str,
+    protocol: str | None = None,
+    mode: str | None = None,
+    debug: bool = False,
+    output_dir: str | None = None,
+) -> dict:
+    """Expand MinARX temporarily, overlay future recovery, and run recovery.
+
+    The archive never contains the simulated future recovery output or a
+    comparison key log.  The generated packet envelope is a decoder adapter
+    and is deleted when this function returns.
+    """
+    from minarx import ArchiveError, inspect_archive, materialize_archive
+    from minarx.protocols import CODECS
+
+    archive = Path(archive_path).resolve()
+    recovery = Path(recovery_dir).resolve()
+    try:
+        metadata = inspect_archive(archive)
+    except ArchiveError as exc:
+        return {"success": False, "error": str(exc)}
+    archive_protocol = metadata["protocol"]
+    archive_mode = metadata["mode"]
+    if protocol and protocol != archive_protocol:
+        return {"success": False, "error": "protocol does not match MinARX archive"}
+    if mode and mode != archive_mode:
+        return {"success": False, "error": "mode does not match MinARX archive"}
+
+    codec = CODECS[archive_protocol]
+    with tempfile.TemporaryDirectory(prefix="hndl-minarx-") as temporary:
+        capture_dir = Path(temporary)
+        try:
+            materialize_archive(archive, capture_dir)
+        except ArchiveError as exc:
+            return {"success": False, "error": str(exc)}
+        keys_dir = capture_dir / "keys"
+        keys_dir.mkdir(parents=True, exist_ok=True)
+        missing = []
+        for filename in codec.RECOVERY_FILES_BY_MODE.get(
+            archive_mode, codec.RECOVERY_FILES
+        ):
+            source = _minarx_recovery_source(recovery, filename)
+            if not source.is_file():
+                missing.append(filename)
+            else:
+                shutil.copy2(source, keys_dir / filename)
+        if missing:
+            return {
+                "success": False,
+                "error": "missing future-recovery input(s): " + ", ".join(missing),
+            }
+
+        derivation_mode = None if archive_mode == "default" else archive_mode
+        spec = recovery_spec(archive_protocol, derivation_mode, metadata["server_port"])
+        artifact_names = [
+            relative
+            for relative in (*spec.archives, spec.simulated_recovery)
+            if (capture_dir / relative).is_file()
+        ]
+        manifest = {
+            "schema": "hndl-run-manifest-v1",
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "experiment": {
+                "protocol": archive_protocol,
+                "mode": derivation_mode,
+                "port": metadata["server_port"],
+                "source": "materialized MinARX archive",
+                "minarx_profile": metadata["profile"]["name"],
+            },
+            "recovery": spec.to_dict(),
+            "artifacts": {
+                relative: {
+                    "bytes": (capture_dir / relative).stat().st_size,
+                    "sha256": sha256_file(capture_dir / relative),
+                }
+                for relative in artifact_names
+            },
+            "evidence_boundary": {
+                "attack_inputs": [*spec.archives, spec.simulated_recovery],
+                "excluded_from_attack_inputs": list(spec.ground_truth),
+            },
+        }
+        (capture_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n"
+        )
+        result = derive(str(capture_dir), debug=debug)
+        destination = (
+            Path(output_dir).resolve()
+            if output_dir
+            else archive.with_suffix(".derived")
+        )
+        derived_dir = capture_dir / "derived"
+        if derived_dir.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(derived_dir, destination, dirs_exist_ok=True)
+            result["output_dir"] = str(destination)
+        result["archive_path"] = str(archive)
+        result["compacted_input"] = True
+        result["recovery_inputs_counted"] = False
+        return result
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--capture-dir", required=True, help="capture directory")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--capture-dir", help="capture directory")
+    source.add_argument("--compacted", metavar="ARCHIVE", help="MinARX archive")
     parser.add_argument(
         "--protocol",
         choices=[protocol.value for protocol in Protocol],
@@ -276,11 +391,33 @@ def _parser() -> argparse.ArgumentParser:
         "--port", type=int, help="optional assertion; normally read from manifest"
     )
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--recovery-dir",
+        help="directory containing only simulated future-recovery input(s)",
+    )
+    parser.add_argument(
+        "--output-dir", help="where MinARX-mode derived outputs are copied"
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.compacted:
+        if not args.recovery_dir:
+            print("Recovery failed: --compacted requires --recovery-dir", file=sys.stderr)
+            return 2
+        result = derive_compacted(
+            args.compacted,
+            args.recovery_dir,
+            args.protocol,
+            args.mode,
+            args.debug,
+            args.output_dir,
+        )
+        if not result.get("success") and result.get("error"):
+            print(f"Recovery failed: {result['error']}", file=sys.stderr)
+        return 0 if result.get("success") else 1
     result = recover_protocol(
         args.capture_dir,
         args.protocol,

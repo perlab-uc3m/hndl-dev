@@ -181,7 +181,7 @@ build_openssh() {
   if [ ! -x "configure" ] || ! git diff --quiet -- configure.ac; then
     echov "Running autoreconf (configure missing or configure.ac modified)..."
     autoreconf -fvi
-  elif [ "configure.ac" -nt "configure" ]; then
+  elif [ "configure.ac" -nt "configure" ] || [ -n "$(find m4 -type f -newer configure -print -quit)" ]; then
     echov "Refreshing generated configure timestamp after Git checkout..."
     touch configure
   fi

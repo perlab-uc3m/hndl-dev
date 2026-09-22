@@ -696,6 +696,11 @@ def materialized_recovery_spec(
 ) -> Iterator[RecoverySpec]:
     """Yield PCAP-backed inputs for a policy archive, removing adapters afterward."""
     root = Path(capture_dir).resolve()
+    if not (root / "manifest.json").is_file():
+        # Raw/synthetic decoder inputs (including a materialized MinARX
+        # archive) already contain PCAPs and do not need policy adaptation.
+        yield spec
+        return
     manifest = RunManifest.load(root)
     metadata = manifest.data.get("archive_policy")
     if not isinstance(metadata, dict):

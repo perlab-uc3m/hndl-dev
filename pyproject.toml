@@ -22,7 +22,7 @@ hndl = "hndl:main"
 py-modules = ["hndl", "experiment", "archive_policy"]
 
 [tool.setuptools.packages.find]
-include = ["capture*", "decryptor*"]
+include = ["capture*", "decryptor*", "minarx*"]
 
 [tool.black]
 line-length = 88
