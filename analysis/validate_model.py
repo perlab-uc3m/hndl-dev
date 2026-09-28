@@ -151,7 +151,13 @@ def _capture_tls_controlled(
     )
     t_srv_out = threading.Thread(
         target=reader_thread,
-        args=(server.stdout, logs_dir / "srv_out.log", "server", eph_store, server_accept_event),
+        args=(
+            server.stdout,
+            logs_dir / "srv_out.log",
+            "server",
+            eph_store,
+            server_accept_event,
+        ),
     )
     t_srv_err = threading.Thread(
         target=reader_thread,
@@ -724,14 +730,28 @@ def main():
 
     with (outdir / "model_validation.csv").open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["protocol", "payload_bytes", "captured_frame_bytes", "alpha_measured", "alpha_model"])
+        writer.writerow(
+            [
+                "protocol",
+                "payload_bytes",
+                "captured_frame_bytes",
+                "alpha_measured",
+                "alpha_model",
+            ]
+        )
         models = {model.label: model for model in PROTOCOLS}
         for label, points in empirical.items():
             for payload, total, alpha in points:
-                writer.writerow([label, payload, total, alpha, models[label].alpha(payload)])
+                writer.writerow(
+                    [label, payload, total, alpha, models[label].alpha(payload)]
+                )
     print_summary(empirical, PROTOCOLS)
-    if any(len(empirical.get(label, [])) != len(payload_sizes) for label in args.protocols):
-        raise RuntimeError("incomplete capture sweep; see model_validation.csv and capture logs")
+    if any(
+        len(empirical.get(label, [])) != len(payload_sizes) for label in args.protocols
+    ):
+        raise RuntimeError(
+            "incomplete capture sweep; see model_validation.csv and capture logs"
+        )
     selected_models = [model for model in PROTOCOLS if model.label in empirical]
     plot_validation(empirical, selected_models, outdir)
 

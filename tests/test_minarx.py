@@ -458,18 +458,23 @@ class MinArxTests(unittest.TestCase):
         )
         retry = _handshake(
             2,
-            bytes.fromhex("0303") + retry_random + bytes.fromhex("00130100")
-            + len(extensions).to_bytes(2, "big") + extensions,
+            bytes.fromhex("0303")
+            + retry_random
+            + bytes.fromhex("00130100")
+            + len(extensions).to_bytes(2, "big")
+            + extensions,
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             capture = self._capture(
                 root,
                 "tls13_1rtt.pcapng",
-                [Chunk(0, _record(22, client_hello)),
-                 Chunk(1, _record(22, retry)),
-                 Chunk(0, _record(22, client_hello)),
-                 Chunk(1, _record(22, server_hello))],
+                [
+                    Chunk(0, _record(22, client_hello)),
+                    Chunk(1, _record(22, retry)),
+                    Chunk(0, _record(22, client_hello)),
+                    Chunk(1, _record(22, server_hello)),
+                ],
                 "tcp",
                 44443,
             )
