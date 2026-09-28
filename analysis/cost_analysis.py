@@ -34,12 +34,12 @@ COLOR_PALETTE = [_CMAP(x) for x in np.linspace(0, 1, 5)]
 L234_OVERHEAD = 54  # Ethernet 14 + IP 20 + TCP 20
 L234_UDP_OVERHEAD = 42  # Ethernet 14 + IP 20 + UDP 8
 TLS_MAX_RECORD = 16384  # RFC 8446 / RFC 5246
-SSH_MAX_PACKET = 32768  # RFC 4253 §6.1
+SSH_MAX_PACKET = 32768  # Assumed SSH packet-size scale, not a protocol limit.
 
 
 @dataclass
 class ProtocolModel:
-    """Deterministic per-session storage model for one protocol/mode."""
+    """Approximate per-session storage model for one protocol/mode."""
 
     name: str
     label: str
@@ -56,20 +56,12 @@ class ProtocolModel:
     linestyle: str
     marker: str
 
-    def _ssh_padding(self, payload_per_record: float) -> float:
-        """SSH per-packet padding (RFC 4253 §6): padding_length byte + padding."""
+    def _mean_ssh_padding(self) -> float:
+        """Mean length byte plus padding, assuming uniform alignment residues."""
         if self.padding_block_size == 0:
             return 0
-        bs = self.padding_block_size
-        # RFC 4253 §6: length(packet_length||padding_length||payload||padding)
-        # must be a multiple of the cipher block size (or 8, whichever larger).
-        # The packet_length field itself is 4 bytes and is included.
-        inner = self.record_header + 1 + int(payload_per_record)
-        rem = inner % bs
-        pad = (bs - rem) % bs  # raw alignment, may be 0
-        if pad < 4:
-            pad += bs
-        return 1 + pad  # padding_length field + actual padding bytes
+        # Padding spans 4 through block_size + 3 bytes; add its length byte.
+        return 1 + 4 + (self.padding_block_size - 1) / 2
 
     def session_bytes(self, plaintext: float) -> float:
         """Total bytes an adversary must store for this session."""
@@ -88,7 +80,7 @@ class ProtocolModel:
             max_payload_per_rec = self.max_record
         n_records = max(1, int(np.ceil(plaintext / max_payload_per_rec)))
         payload_per_rec = plaintext / n_records
-        padding = self._ssh_padding(payload_per_rec)
+        padding = self._mean_ssh_padding()
         l234 = L234_UDP_OVERHEAD if self.is_udp else L234_OVERHEAD
         per_record = (
             self.record_header

@@ -10,6 +10,25 @@ from analysis.storage_model import (
 )
 from analysis.monte_carlo_cost import MCConfig, run_monte_carlo
 from analysis.quantum_work import recovery_cost
+from analysis.cost_analysis import SSH_X25519
+
+
+class ProtocolOverheadTests(unittest.TestCase):
+    def test_ssh_mean_padding_matches_packet_alignments(self):
+        # OpenSSH's ChaCha20 path aligns the length byte plus payload,
+        # excluding the separately encrypted four-byte packet length.
+        overheads = []
+        for payload in range(8):
+            padding = 4
+            while (1 + payload + padding) % 8:
+                padding += 1
+            overheads.append(1 + padding)
+        self.assertEqual(sorted(overheads), list(range(5, 13)))
+        self.assertEqual(SSH_X25519._mean_ssh_padding(), np.mean(overheads))
+        self.assertEqual(
+            SSH_X25519.record_header + SSH_X25519.aead_tag + np.mean(overheads),
+            28.5,
+        )
 
 
 class StorageTests(unittest.TestCase):
