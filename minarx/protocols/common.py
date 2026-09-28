@@ -275,6 +275,12 @@ def tls_hello_parameters(chunks: list[Chunk]) -> dict:
             client_hello = message
         elif message[0] == 2 and server_hello is None:
             server_hello = message
+    # RFC 8446, Section 4.1.3: HRR has ServerHello's format but a special
+    # random. Its transcript rules are outside the supported archive profiles.
+    if server_hello is not None and server_hello[6:38] == bytes.fromhex(
+        "CF21AD74E59A6111BE1D8C021E65B891C2A211167ABB8C5E079E09E2C8A8339C"
+    ):
+        raise ValueError("HelloRetryRequest is outside the supported MinARX profiles")
     if client_hello is None:
         raise ValueError("profile validation could not find ClientHello")
 

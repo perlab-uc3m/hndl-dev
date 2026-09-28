@@ -31,11 +31,15 @@ For TLS 1.3, every protected record has outer content type
 application data—is opaque. For TLS 1.2, application records and all records
 after each direction's ChangeCipherSpec are opaque. Complete QUIC datagrams are
 opaque because header protection can sample ciphertext/tag bytes. The ordered
-SSH ciphertext stream is opaque because packet lengths are encrypted.
+SSH byte stream is opaque; the tested ChaCha20 cipher encrypts packet lengths.
 
-These rules follow the record and transcript dependencies in the local copies
-of RFC 5246, RFC 7627, RFC 8446, RFC 9000, RFC 9001, and RFC 4253 under
-[`references/`](../references/).
+These rules follow the record and transcript dependencies in
+[RFC 5246](https://www.rfc-editor.org/rfc/rfc5246),
+[RFC 7627](https://www.rfc-editor.org/rfc/rfc7627),
+[RFC 8446](https://www.rfc-editor.org/rfc/rfc8446),
+[RFC 9000](https://www.rfc-editor.org/rfc/rfc9000),
+[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001), and
+[RFC 4253](https://www.rfc-editor.org/rfc/rfc4253).
 
 ## Version 1 binary layout
 
@@ -80,15 +84,27 @@ for each mode and are therefore omitted.
 | QUIC v1 | PCAP/Ethernet/IP/UDP envelope; readiness probes; datagram direction/length descriptors | complete QUIC datagrams, including tags and header-protection samples |
 | SSH initial/rekey stream | PCAP/Ethernet/IP/TCP envelope; retransmissions; directional chunk descriptors | ordered SSH byte streams |
 
-The TLS policies preserve clear transcript bytes rather than assuming that a
-future compromise reveals a live transcript hash state. Certificate bytes are
-not assumed to be globally shared or free. QUIC authentication tags are not
-stripped: RFC 9001 permits header-protection samples to overlap tag bytes.
+TLS 1.2 RSA can use a smaller key-derivation summary: the encrypted pre-master
+secret, both randoms, negotiated algorithms, and the RSA recovery target. With
+EMS it additionally needs the session hash through ClientKeyExchange, which
+can be computed during collection from the clear handshake. MinARX retains the
+clear transcript to reuse the existing decoder; this possible further reduction
+is not implemented. Its size is therefore an achieved upper bound on the
+minimum sufficient archive.
 
-SSH is deliberately conservative. Packet lengths are encrypted, so MinARX
-round-trips the ordered directional streams rather than assuming packet
-boundaries. The public decoder then performs its normal isolated-oracle
-recovery and authenticates the controlled channel marker.
+TLS 1.3 has a different constraint: a passive collector cannot hash the plaintext
+of the encrypted handshake suffix before key recovery. MinARX retains those
+protected records and the clear prefix. Ticket resumption includes both source
+and resumed sessions; external PSK recovery supplies the PSK separately.
+HelloRetryRequest is rejected because its transcript transformation is outside
+the supported profiles. Certificate bytes are not assumed globally available.
+QUIC tags remain because packet authentication and header protection use them.
+
+SSH is deliberately conservative. ChaCha20 packet lengths are encrypted, so
+MinARX round-trips the ordered streams rather than assuming packet boundaries.
+The AES-GCM archive profile uses the same projection although its lengths are
+clear. Authenticated live SSH recovery is tested with ChaCha20; a successful
+archive round trip does not establish decoder support for every cipher.
 
 ## Profiles and categories
 
@@ -162,7 +178,11 @@ python3 scripts/minarx_experiment.py data/<capture> [...] \
 ```
 
 The checked reference results are
-`analysis/results/minarx_live_2026-09-22.json` and `.csv`.
+`analysis/results/minarx_live_2026-09-22.json` and `.csv` (the paper table).
+A fresh six-mode check on 2026-09-28 also passed authenticated recovery without
+reference key logs; its separate results are `minarx_live_2026-09-28.json` and
+`.csv` in the same directory. Small size differences reflect new transcripts
+and packetization, not a change in the accounting formula.
 
 ## Creation and future decoding
 
@@ -193,6 +213,6 @@ python3 -m pytest -q tests/test_minarx.py
 ```
 
 It covers every registered profile, exact transport round trips, TLS 1.3
-keyshare/shared-secret reconstruction, profile mismatch rejection, checksum
+keyshare/shared-secret reconstruction, profile mismatch and HelloRetryRequest rejection, checksum
 failure, compacted derivation, layout-only compression, and the
 repetitive-versus-random opaque-payload size invariant.

@@ -1,0 +1,33 @@
+{
+  "seed": 42,
+  "config": {
+    "global_traffic_zb_year": 8.8,
+    "retention_ratio": 1.0,
+    "harvest_fractions": [
+      0.001,
+      0.005,
+      0.01,
+      0.05,
+      0.1
+    ],
+    "storage_cost_tb_year": 11.064112186431885,
+    "storage_cost_band": 0.3,
+    "traffic_growth_lo": 0.2,
+    "traffic_growth_hi": 0.3,
+    "media_decline_lo": -0.1,
+    "media_decline_hi": 0.2,
+    "retention_years": [
+      5,
+      10,
+      15
+    ],
+    "n_draws": 10000
+  },
+  "numpy_version": "2.4.6",
+  "bit_generator": "PCG64",
+  "units": "decimal TB; nominal USD; 365-day years",
+  "accounting": "whole cohort charged in acquisition year; common horizon",
+  "price_source": "https://aws.amazon.com/s3/pricing/",
+  "price_checked": "2026-09-28",
+  "billing_gib_month_usd": 0.00099
+}

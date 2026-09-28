@@ -1,9 +1,9 @@
 """SSH archive policy (RFC 4253).
 
-The ordered directional TCP byte stream is retained.  SSH encrypts its packet
-length, so an online collector cannot safely import post-KEX packet boundaries
-before the future recovery output is available.  The stream is therefore kept
-in the opaque region; only direction and length descriptors are compressible.
+The ordered directional TCP byte stream is retained.  The tested ChaCha20
+cipher encrypts packet lengths, so a collector cannot infer protected packet
+boundaries.  The AES-GCM archive profile uses the same conservative projection
+although its lengths are clear.  Only direction and chunk lengths are compressed.
 """
 
 from pathlib import Path
@@ -97,8 +97,8 @@ def compact(capture_dir: Path, mode: str, port: int, profile: ProtocolProfile):
         {
             "policy": "ordered-directional-ciphertext-stream",
             "encrypted_packet_boundaries": "not-assumed",
-            "future_recovery_input": "current decoder imports endpoint K/H/session_id and remains an explicit incomplete evidence boundary",
-            "authenticated_passive_recovery": False,
+            "future_recovery_input": "isolated oracle supplies each epoch's X25519 private scalar; K, H, and session_id are derived from the archive",
+            "authenticated_recovery_cipher": "chacha20-poly1305@openssh.com",
             "profile_validation": "KEX and both directional ciphers checked from clear KEXINIT",
             "captures": measurements,
         },

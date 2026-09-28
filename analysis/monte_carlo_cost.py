@@ -1,620 +1,251 @@
 #!/usr/bin/env python3
-"""Monte Carlo sensitivity analysis for HN-DL harvest cost.
+"""Conditional storage-cost scenarios, not forecasts of adversary spending.
 
-Parameterises the deterministic model from cost_analysis.py with
-distributional inputs and runs N draws to produce annual and
-cumulative harvest-cost estimates.
+Traffic is observed bytes, not plaintext. One price, growth rate and price
+decline are drawn per scenario. Rates stay fixed along each trajectory.
 """
-
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+import csv
+import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------------
+try:
+    from .storage_model import (
+        REFERENCE_USD_PER_TB_YEAR,
+        annual_archive_tb,
+        recurring_storage_cost,
+    )
+except ImportError:
+    from storage_model import (
+        REFERENCE_USD_PER_TB_YEAR,
+        annual_archive_tb,
+        recurring_storage_cost,
+    )
+
 RNG_SEED = 42
-
-# ---------------------------------------------------------------------------
-# Plot style  — identical to cost_analysis.py
-# ---------------------------------------------------------------------------
-plt.rcParams["font.family"] = "Ubuntu"
-plt.rcParams["pdf.fonttype"] = 42
-plt.rcParams["ps.fonttype"] = 42
-
-_CMAP = mcolors.LinearSegmentedColormap.from_list("", ["#9fcf69", "#33acdc"])
-# 5 distinct colours for harvest-fraction groups (0.1%, 0.5%, 1%, 5%, 10%)
-_N_FRACTIONS = 5
-COLOR_PALETTE = [_CMAP(x) for x in np.linspace(0, 1, _N_FRACTIONS)]
-
-
-def _style_ax(ax):
-    ax.grid(True, linestyle="--", which="both", color="grey", alpha=0.4)
-    ax.set_axisbelow(True)
-    ax.tick_params(axis="both", labelsize=14)
-
-
-# ===================================================================
-#  Configuration — single place to tune every distributional input
-# ===================================================================
+plt.rcParams.update({"font.family": "DejaVu Sans", "pdf.fonttype": 42})
+COLORS = ["#548b37", "#83b64e", "#369faa", "#287cb8"]
 
 
 @dataclass
 class MCConfig:
-    """All Monte Carlo parameters in one place.
-
-    Payload: log-normal (median ≈ 2 MB, calibrated to HTTP Archive 2024).
-    Storage cost: uniform band around $/TB-yr baseline.
-    Traffic growth and media-cost decline: uniform draws.
-    """
-
-    # --- Session payload (log-normal in bytes) ---
-    payload_log_mu: float = np.log(2e6)
-    payload_log_sigma: float = 1.5
-
-    global_traffic_zb_year: float = 8.8  # ITU 2025
-
-    harvest_fractions: list[float] = field(
-        default_factory=lambda: [0.001, 0.005, 0.01, 0.05, 0.10]
-    )
-    harvest_labels: list[str] = field(
-        default_factory=lambda: ["0.1%", "0.5%", "1%", "5%", "10%"]
-    )
-
-    storage_cost_tb_year: float = 12.16  # AWS OpEx upper bound
-    storage_cost_band: float = 0.30  # ±30% uniform
-    is_capex: bool = False
-
+    global_traffic_zb_year: float = 8.8
+    retention_ratio: float = 1.0
+    harvest_fractions: tuple[float, ...] = (0.001, 0.005, 0.01, 0.05, 0.10)
+    storage_cost_tb_year: float = REFERENCE_USD_PER_TB_YEAR
+    storage_cost_band: float = 0.30
     traffic_growth_lo: float = 0.20
     traffic_growth_hi: float = 0.30
-
     media_decline_lo: float = -0.10
     media_decline_hi: float = 0.20
-
-    retention_years: list[int] = field(default_factory=lambda: [5, 10, 15])
-
+    retention_years: tuple[int, ...] = (5, 10, 15)
     n_draws: int = 10_000
 
-
-# ===================================================================
-#  Core Monte Carlo engine
-# ===================================================================
-
-
-def _representative_alpha(payload_bytes: np.ndarray) -> np.ndarray:
-    """Vectorised TLS 1.3 α (analytical model from cost_analysis.py)."""
-    H = 2160.0
-    n_hs = 16
-    r = 5.0
-    t = 16.0
-    e = 1.0
-    ell = 54.0
-    M = 16384.0
-
-    max_payload_per_rec = M - e  # TLSInnerPlaintext content type consumes 1 B
-    n_records = np.maximum(1, np.ceil(payload_bytes / max_payload_per_rec))
-    payload_per_rec = payload_bytes / n_records
-    per_record = r + payload_per_rec + t + e + ell
-    app_bytes = n_records * per_record
-    hs_bytes = H + n_hs * ell
-    total = hs_bytes + app_bytes
-    return total / payload_bytes
+    def __post_init__(self):
+        if self.n_draws < 1 or not self.retention_years:
+            raise ValueError("positive draw count and retention horizons required")
+        if any(t < 1 or int(t) != t for t in self.retention_years):
+            raise ValueError("retention horizons must be positive whole years")
+        if not self.harvest_fractions or any(f <= 0 for f in self.harvest_fractions):
+            raise ValueError("positive harvest fractions required for log plots")
+        for fraction in self.harvest_fractions:
+            annual_archive_tb(
+                self.global_traffic_zb_year, fraction, self.retention_ratio
+            )
+        values = [
+            self.storage_cost_tb_year,
+            self.storage_cost_band,
+            self.traffic_growth_lo,
+            self.traffic_growth_hi,
+            self.media_decline_lo,
+            self.media_decline_hi,
+        ]
+        if not np.isfinite(values).all():
+            raise ValueError("scenario parameters must be finite")
+        if self.storage_cost_tb_year <= 0 or not 0 <= self.storage_cost_band < 1:
+            raise ValueError("positive price and a price band in [0, 1) required")
+        if not -1 < self.traffic_growth_lo <= self.traffic_growth_hi:
+            raise ValueError("invalid traffic growth range")
+        if not self.media_decline_lo <= self.media_decline_hi < 1:
+            raise ValueError("invalid price decline range")
+        if self.global_traffic_zb_year <= 0 or self.retention_ratio <= 0:
+            raise ValueError("positive traffic and retention ratio required for plots")
 
 
 def run_monte_carlo(cfg: MCConfig, rng: np.random.Generator):
-    """Run the full Monte Carlo and return results dict."""
-    n = cfg.n_draws
-
-    # --- Draw random inputs ---
-    payload = rng.lognormal(
-        mean=cfg.payload_log_mu, sigma=cfg.payload_log_sigma, size=n
+    price = rng.uniform(
+        cfg.storage_cost_tb_year * (1 - cfg.storage_cost_band),
+        cfg.storage_cost_tb_year * (1 + cfg.storage_cost_band),
+        cfg.n_draws,
     )
-    payload = np.clip(payload, 100, 1e9)
-
-    cost_lo = cfg.storage_cost_tb_year * (1 - cfg.storage_cost_band)
-    cost_hi = cfg.storage_cost_tb_year * (1 + cfg.storage_cost_band)
-    storage_cost = rng.uniform(cost_lo, cost_hi, size=n)
-
-    growth_rate = rng.uniform(cfg.traffic_growth_lo, cfg.traffic_growth_hi, size=n)
-    media_decline = rng.uniform(cfg.media_decline_lo, cfg.media_decline_hi, size=n)
-
-    alpha = _representative_alpha(payload)
-    global_bytes_per_day = cfg.global_traffic_zb_year * 1e21 / 365.0
-    sessions_per_day = global_bytes_per_day / payload
-
-    # --- Annual cost for each harvest fraction ---
-    annual_cost = {}
-    for fi, frac in enumerate(cfg.harvest_fractions):
-        # Annual stored bytes
-        annual_stored_bytes = sessions_per_day * frac * (alpha * payload) * 365.0
-        annual_stored_tb = annual_stored_bytes / 1e12
-        annual_cost[fi] = annual_stored_tb * storage_cost
-
-    # --- Cumulative cost over retention horizons ---
-    cumulative_cost = {}
-    for fi, frac in enumerate(cfg.harvest_fractions):
-        cumulative_cost[fi] = {}
-        for ti, T_r in enumerate(cfg.retention_years):
-            # Calendar-year accounting.  Under recurring capacity rental, all
-            # retained cohorts are charged at that calendar year's unit price;
-            # acquisition-year pricing cannot be frozen for a cohort's life.
-            cum = np.zeros(n)
-            # V_0 = annual stored TB for base year
-            annual_stored_bytes_base = (
-                sessions_per_day * frac * (alpha * payload) * 365.0
-            )
-            V_0 = annual_stored_bytes_base / 1e12  # TB
-            C_0 = storage_cost  # $/TB
-
-            inventory = np.zeros(n)
-            for year in range(T_r):
-                V_i = V_0 * (1 + growth_rate) ** year
-                C_i = C_0 * (1 - media_decline) ** year
-                if cfg.is_capex:
-                    cum += V_i * C_i
-                else:
-                    inventory += V_i
-                    cum += inventory * C_i
-
-            cumulative_cost[fi][ti] = cum
-
+    growth = rng.uniform(cfg.traffic_growth_lo, cfg.traffic_growth_hi, cfg.n_draws)
+    decline = rng.uniform(cfg.media_decline_lo, cfg.media_decline_hi, cfg.n_draws)
+    years = np.arange(max(cfg.retention_years))
+    prices = price[:, None] * (1 - decline[:, None]) ** years
+    volume_factors = (1 + growth[:, None]) ** years
+    annual, cumulative = {}, {}
+    for fi, fraction in enumerate(cfg.harvest_fractions):
+        base = annual_archive_tb(
+            cfg.global_traffic_zb_year, fraction, cfg.retention_ratio
+        )
+        annual[fi] = base * price
+        cohorts = base * volume_factors
+        cumulative[fi] = {
+            ti: recurring_storage_cost(cohorts[:, :horizon], prices[:, :horizon])
+            for ti, horizon in enumerate(cfg.retention_years)
+        }
     return {
-        "annual_cost": annual_cost,
-        "cumulative_cost": cumulative_cost,
-        "payload": payload,
-        "alpha": alpha,
-        "storage_cost": storage_cost,
-        "growth_rate": growth_rate,
-        "media_decline": media_decline,
         "cfg": cfg,
+        "annual_cost": annual,
+        "cumulative_cost": cumulative,
+        "storage_cost": price,
+        "growth_rate": growth,
+        "media_decline": decline,
     }
 
 
-# ===================================================================
-#  Plotting
-# ===================================================================
-
-
-def plot_annual_cost_violin(results: dict, outdir: Path) -> Path:
-    """Violin plot: annual harvest cost ($B/yr) per harvest fraction."""
+def summary_rows(results):
+    rows = []
     cfg = results["cfg"]
-    fig, ax = plt.subplots(figsize=(10, 6))
-    _style_ax(ax)
-
-    data = []
-    positions = []
-    colors = []
-    for fi, (frac, label) in enumerate(zip(cfg.harvest_fractions, cfg.harvest_labels)):
-        cost_b = results["annual_cost"][fi] / 1e9  # $ → $B
-        data.append(cost_b)
-        positions.append(fi)
-        colors.append(COLOR_PALETTE[fi])
-
-    parts = ax.violinplot(
-        data,
-        positions=positions,
-        showmeans=False,
-        showmedians=False,
-        showextrema=False,
-    )
-    for i, body in enumerate(parts["bodies"]):
-        body.set_facecolor(colors[i])
-        body.set_edgecolor("black")
-        body.set_alpha(0.75)
-        body.set_linewidth(0.8)
-
-    # Overlay box plots for quartiles + median
-    bp = ax.boxplot(
-        data,
-        positions=positions,
-        widths=0.12,
-        patch_artist=True,
-        showfliers=False,
-        medianprops=dict(color="white", linewidth=2),
-        boxprops=dict(linewidth=0.8),
-        whiskerprops=dict(linewidth=0.8),
-        capprops=dict(linewidth=0.8),
-    )
-    for i, patch in enumerate(bp["boxes"]):
-        patch.set_facecolor(colors[i])
-        patch.set_alpha(0.9)
-
-    # Add median annotations
-    for fi in range(len(cfg.harvest_fractions)):
-        med = np.median(data[fi])
-        q25, q75 = np.percentile(data[fi], [25, 75])
-        ax.annotate(
-            f"${med:,.1f}B",
-            xy=(fi, med),
-            xytext=(0.35, 0),
-            textcoords="offset fontsize",
-            fontsize=12,
-            fontweight="bold",
-            color=colors[fi],
-            va="center",
-        )
-
-    ax.set_xticks(positions)
-    ax.set_xticklabels(cfg.harvest_labels, fontsize=15)
-    ax.set_xlabel(
-        "Harvest fraction of global encrypted traffic", fontweight="bold", fontsize=15
-    )
-    ax.set_ylabel(
-        "Annual harvest cost (\\$B/year)", fontweight="bold", fontsize=15, labelpad=15
-    )
-    ax.set_title(
-        f"Monte Carlo sensitivity: annual HN-DL cost " f"({cfg.n_draws:,} draws)",
-        fontweight="bold",
-        fontsize=17,
-        pad=15,
-    )
-    ax.set_yscale("log")
-
-    # Add parameter annotation box
-    med_payload = np.exp(cfg.payload_log_mu)
-    ann_text = (
-        f"Session payload: log-normal "
-        f"(median {med_payload/1e6:.1f} MB, σ={cfg.payload_log_sigma})\n"
-        f"Storage cost: \\${cfg.storage_cost_tb_year}/TB-yr "
-        f"± {cfg.storage_cost_band*100:.0f}%\n"
-        f"Global traffic: {cfg.global_traffic_zb_year} ZB/yr"
-    )
-    ax.text(
-        0.02,
-        0.98,
-        ann_text,
-        transform=ax.transAxes,
-        fontsize=11,
-        verticalalignment="top",
-        bbox=dict(
-            boxstyle="round,pad=0.4", facecolor="white", edgecolor="grey", alpha=0.85
-        ),
-    )
-
-    fig.tight_layout()
-    outpath = outdir / "mc_annual_cost.pdf"
-    fig.savefig(outpath, dpi=300, bbox_inches="tight")
-    print(f"[+] Saved: {outpath}")
-    plt.close(fig)
-    return outpath
-
-
-def plot_cumulative_cost_shaded(results: dict, outdir: Path) -> Path:
-    """Fan-chart ribbon plot: cumulative cost vs. harvest fraction.
-
-    Nested percentile bands (90%, 50%) plus median line, one layer per
-    retention horizon T_r.
-    """
-    cfg = results["cfg"]
-
-    # Four series: Annual (1 yr), T_r = 5, 10, 15 yr
-    _cmap = mcolors.LinearSegmentedColormap.from_list("", ["#9fcf69", "#33acdc"])
-    _all_years = [1] + list(cfg.retention_years)  # [1, 5, 10, 15]
-    _norm = [y / max(_all_years) for y in _all_years]  # [0.067, 0.33, 0.67, 1.0]
-    _all_colors = [_cmap(t) for t in _norm]
-    annual_color = _all_colors[0]
-    tr_colors = _all_colors[1:]
-
-    # --- Continuous harvest-fraction axis ---
-    frac_min, frac_max = 0.001, 0.10  # 0.1 % – 10 %
-    fracs = np.logspace(np.log10(frac_min), np.log10(frac_max), 300)
-    frac_pct = fracs * 100  # for the x-axis label
-
-    # Use the 1% reference bucket to derive per-draw "unit cost"
-    ref_fi = 2  # index of 1 % in harvest_fractions
-    ref_frac = cfg.harvest_fractions[ref_fi]
-
-    fig, ax = plt.subplots(figsize=(11, 6))
-    _style_ax(ax)
-
-    # Plot from largest T_r (back) to smallest (front)
-    for ti in reversed(range(len(cfg.retention_years))):
-        T_r = cfg.retention_years[ti]
-        color = tr_colors[ti]
-
-        # Per-draw unit cost ($B per unit fraction)
-        unit_cost = results["cumulative_cost"][ref_fi][ti] / (1e9 * ref_frac)
-
-        # Percentile profiles across the continuous fraction axis
-        p5 = np.percentile(unit_cost, 5) * fracs
-        p25 = np.percentile(unit_cost, 25) * fracs
-        p50 = np.median(unit_cost) * fracs
-        p75 = np.percentile(unit_cost, 75) * fracs
-        p95 = np.percentile(unit_cost, 95) * fracs
-
-        # Outer band  (5th–95th percentile)
-        ax.fill_between(frac_pct, p5, p95, alpha=0.18, color=color, linewidth=0)
-        # Inner band  (25th–75th percentile)
-        ax.fill_between(frac_pct, p25, p75, alpha=0.35, color=color, linewidth=0)
-        # Median line
-        ax.plot(
-            frac_pct,
-            p50,
-            color=color,
-            linewidth=2.5,
-            label=f"Cumulative, $T_r$ = {T_r} yr",
-            zorder=4,
-        )
-
-    # --- Annual cost ribbon (front-most) ---
-    unit_annual = results["annual_cost"][ref_fi] / (1e9 * ref_frac)
-
-    p5_a = np.percentile(unit_annual, 5) * fracs
-    p25_a = np.percentile(unit_annual, 25) * fracs
-    p50_a = np.median(unit_annual) * fracs
-    p75_a = np.percentile(unit_annual, 75) * fracs
-    p95_a = np.percentile(unit_annual, 95) * fracs
-
-    ax.fill_between(frac_pct, p5_a, p95_a, alpha=0.18, color=annual_color, linewidth=0)
-    ax.fill_between(frac_pct, p25_a, p75_a, alpha=0.35, color=annual_color, linewidth=0)
-    ax.plot(
-        frac_pct, p50_a, color=annual_color, linewidth=2.5, label="Annual", zorder=4
-    )
-
-    # --- Error-bar markers at simulated harvest fractions ---
-    _markers = ["o", "s", "D"]  # one per T_r (annual uses "^")
-    for ti in range(len(cfg.retention_years)):
-        color = tr_colors[ti]
-        for fi, frac in enumerate(cfg.harvest_fractions):
-            cost_b = results["cumulative_cost"][fi][ti] / 1e9
-            med = np.median(cost_b)
-            p5 = np.percentile(cost_b, 5)
-            p95 = np.percentile(cost_b, 95)
-            ax.errorbar(
-                frac * 100,
-                med,
-                yerr=[[med - p5], [p95 - med]],
-                fmt=_markers[ti % len(_markers)],
-                color=color,
-                markeredgecolor="black",
-                markeredgewidth=0.7,
-                markersize=5,
-                ecolor="black",
-                elinewidth=0.9,
-                capsize=3,
-                capthick=0.9,
-                zorder=7,
+    for fi, fraction in enumerate(cfg.harvest_fractions):
+        series = [(1, results["annual_cost"][fi])]
+        series += [
+            (h, results["cumulative_cost"][fi][ti])
+            for ti, h in enumerate(cfg.retention_years)
+        ]
+        for horizon, costs in series:
+            quantiles = np.percentile(costs, [5, 25, 50, 75, 95])
+            rows.append(
+                {
+                    "fraction": fraction,
+                    "years": horizon,
+                    **dict(
+                        zip(
+                            ("p05_usd", "p25_usd", "median_usd", "p75_usd", "p95_usd"),
+                            quantiles,
+                        )
+                    ),
+                    "mean_usd": float(np.mean(costs)),
+                }
             )
+    return rows
 
-    # Annual cost error-bar markers
-    for fi, frac in enumerate(cfg.harvest_fractions):
-        cost_b = results["annual_cost"][fi] / 1e9
-        med = np.median(cost_b)
-        p5 = np.percentile(cost_b, 5)
-        p95 = np.percentile(cost_b, 95)
-        ax.errorbar(
-            frac * 100,
-            med,
-            yerr=[[med - p5], [p95 - med]],
-            fmt="^",
-            color=annual_color,
-            markeredgecolor="black",
-            markeredgewidth=0.7,
-            markersize=5,
-            ecolor="black",
-            elinewidth=0.9,
-            capsize=3,
-            capthick=0.9,
-            zorder=7,
-        )
 
-    # --- Formatting ---
-    ax.set_xscale("log")
-    ax.set_yscale("log")
+def _save(fig, outdir, name):
+    fig.tight_layout()
+    fig.savefig(outdir / name, bbox_inches="tight", metadata={"CreationDate": None})
+    plt.close(fig)
 
-    # Nice percentage tick labels
-    xtick_vals = [0.1, 0.5, 1, 5, 10]
-    ax.set_xticks(xtick_vals)
-    ax.set_xticklabels(
-        [f"{v}%" if v >= 1 else f"{v}%" for v in xtick_vals], fontsize=14
+
+def plot_cumulative_cost_shaded(results, outdir):
+    cfg = results["cfg"]
+    fracs = np.geomspace(min(cfg.harvest_fractions), max(cfg.harvest_fractions), 250)
+    ref = cfg.harvest_fractions[0]
+    series = [("One cohort, one year", results["annual_cost"][0])]
+    series += [
+        (f"{h}-year accumulation", results["cumulative_cost"][0][ti])
+        for ti, h in enumerate(cfg.retention_years)
+    ]
+    fig, ax = plt.subplots(figsize=(10, 5.2))
+    for i, (label, values) in enumerate(series):
+        q = np.percentile(values / (ref * 1e9), [5, 25, 50, 75, 95])[:, None] * fracs
+        color = COLORS[i % len(COLORS)]
+        ax.fill_between(100 * fracs, q[0], q[4], color=color, alpha=0.14)
+        ax.fill_between(100 * fracs, q[1], q[3], color=color, alpha=0.30)
+        ax.plot(100 * fracs, q[2], color=color, label=label, linewidth=2)
+    ax.set(
+        xscale="log",
+        yscale="log",
+        xlabel="Retained fraction of reference traffic",
+        ylabel="Storage cost (USD billion)",
     )
-    ax.set_xlim(frac_pct[0] * 0.7, frac_pct[-1] * 1.4)
-
-    ax.set_xlabel(
-        "Harvest fraction of global encrypted traffic", fontweight="bold", fontsize=15
-    )
-    ax.set_ylabel("HN-DL cost (\\$B)", fontweight="bold", fontsize=15, labelpad=15)
-    ax.set_title(
-        f"Monte Carlo HN-DL cost sensitivity " f"({cfg.n_draws:,} draws)",
-        fontweight="bold",
-        fontsize=17,
-        pad=15,
-    )
-
-    # Legend (ordered: Annual, then T_r ascending)
-    handles, labels = ax.get_legend_handles_labels()
-    tr_h, tr_l = handles[:-1], labels[:-1]
-    ann_h, ann_l = handles[-1:], labels[-1:]
-    ordered_h = ann_h + tr_h[::-1]
-    ordered_l = ann_l + tr_l[::-1]
-    ax.legend(
-        ordered_h,
-        ordered_l,
-        fontsize=13,
-        loc="upper left",
-        framealpha=0.9,
-        edgecolor="black",
-    )
-
-    # Parameter annotation box
-    med_payload = np.exp(cfg.payload_log_mu)
-    ann_text = (
-        f"σ={cfg.payload_log_sigma})\n"
-        f"Storage: \\${cfg.storage_cost_tb_year}/TB-yr "
-        f"± {cfg.storage_cost_band*100:.0f}%\n"
-        f"Traffic growth: "
-        f"{cfg.traffic_growth_lo*100:.0f}–"
-        f"{cfg.traffic_growth_hi*100:.0f}%/yr\n"
-        f"Media cost Δ: "
-        f"{cfg.media_decline_lo*100:+.0f} to "
-        f"{cfg.media_decline_hi*100:+.0f}%/yr"
+    ticks = np.array(cfg.harvest_fractions) * 100
+    ax.set_xticks(ticks, [f"{x:g}%" for x in ticks])
+    ax.grid(which="both", alpha=0.2)
+    ax.legend(loc="upper left", fontsize=10)
+    note = (
+        f"{cfg.n_draws:,} scenario draws; ρ={cfg.retention_ratio:g}\n"
+        f"Initial price: USD {cfg.storage_cost_tb_year:.2f}/TB-year ± {100*cfg.storage_cost_band:g}%\n"
+        f"Traffic growth: {100*cfg.traffic_growth_lo:g} to {100*cfg.traffic_growth_hi:g}%/year\n"
+        f"Price decline δ: {100*cfg.media_decline_lo:g} to {100*cfg.media_decline_hi:g}%/year"
     )
     ax.text(
         0.98,
         0.03,
-        ann_text,
+        note,
         transform=ax.transAxes,
-        fontsize=10,
-        verticalalignment="bottom",
-        horizontalalignment="right",
-        bbox=dict(
-            boxstyle="round,pad=0.4", facecolor="white", edgecolor="grey", alpha=0.85
-        ),
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        bbox={"facecolor": "white", "edgecolor": "0.7", "alpha": 0.95},
     )
-
-    fig.tight_layout()
-    outpath = outdir / "mc_cumulative_cost.pdf"
-    fig.savefig(outpath, dpi=300, bbox_inches="tight")
-    print(f"[+] Saved: {outpath}")
-    plt.close(fig)
-    return outpath
-
-
-def print_summary_table(results: dict):
-    """Print summary to stdout."""
-    cfg = results["cfg"]
-
-    print("\n" + "=" * 72)
-    print("Monte Carlo Sensitivity Analysis — Summary")
-    print("=" * 72)
-
-    # Input distribution summary
-    payload = results["payload"]
-    print(f"\nInput distributions ({cfg.n_draws:,} draws):")
-    print(
-        f"  Session payload  : median {np.median(payload)/1e6:.2f} MB, "
-        f"mean {np.mean(payload)/1e6:.2f} MB, "
-        f"P5={np.percentile(payload, 5)/1e3:.0f} KB, "
-        f"P95={np.percentile(payload, 95)/1e6:.1f} MB"
-    )
-    print(
-        f"  Storage α        : median {np.median(results['alpha']):.3f}, "
-        f"mean {np.mean(results['alpha']):.3f}, "
-        f"P5={np.percentile(results['alpha'], 5):.3f}, "
-        f"P95={np.percentile(results['alpha'], 95):.2f}"
-    )
-    print(
-        f"  Storage cost     : U({cfg.storage_cost_tb_year*(1-cfg.storage_cost_band):.1f}, "
-        f"{cfg.storage_cost_tb_year*(1+cfg.storage_cost_band):.1f}) $/TB-yr"
-    )
-    print(
-        f"  Traffic growth   : U({cfg.traffic_growth_lo*100:.0f}%, "
-        f"{cfg.traffic_growth_hi*100:.0f}%)"
-    )
-    print(
-        f"  Media cost Δ     : U({cfg.media_decline_lo*100:+.0f}%, "
-        f"{cfg.media_decline_hi*100:+.0f}%)"
-    )
-
-    # Annual cost table
-    print(f"\n{'Harvest':<10} {'Median':>12} {'Mean':>12} {'P5':>12} {'P95':>12}")
-    print("-" * 60)
-    for fi, (frac, label) in enumerate(zip(cfg.harvest_fractions, cfg.harvest_labels)):
-        c = results["annual_cost"][fi] / 1e9
-        print(
-            f"{label:<10} ${np.median(c):>10,.1f}B ${np.mean(c):>10,.1f}B "
-            f"${np.percentile(c, 5):>10,.1f}B ${np.percentile(c, 95):>10,.1f}B"
-        )
-
-    # Cumulative cost table
-    for ti, T_r in enumerate(cfg.retention_years):
-        print(f"\nCumulative cost — T_r = {T_r} years:")
-        print(f"{'Harvest':<10} {'Median':>12} {'Mean':>12} {'P5':>12} {'P95':>12}")
-        print("-" * 60)
-        for fi, (frac, label) in enumerate(
-            zip(cfg.harvest_fractions, cfg.harvest_labels)
-        ):
-            c = results["cumulative_cost"][fi][ti] / 1e9
-            print(
-                f"{label:<10} ${np.median(c):>10,.1f}B ${np.mean(c):>10,.1f}B "
-                f"${np.percentile(c, 5):>10,.1f}B ${np.percentile(c, 95):>10,.1f}B"
-            )
-
-
-# ===================================================================
-#  CLI
-# ===================================================================
+    _save(fig, outdir, "mc_cumulative_cost.pdf")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Monte Carlo sensitivity analysis for HN-DL harvest cost"
-    )
-    parser.add_argument(
-        "--draws",
-        type=int,
-        default=10_000,
-        help="Number of Monte Carlo draws (default: 10,000)",
-    )
-    parser.add_argument(
-        "--outdir",
-        default="paper/figures",
-        help="Output directory for figures (default: paper/figures)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=RNG_SEED,
-        help=f"RNG seed for reproducibility (default: {RNG_SEED})",
-    )
-    # Allow overriding key parameters from CLI for quick experiments
-    parser.add_argument(
-        "--payload-mu",
-        type=float,
-        default=None,
-        help="Override payload_log_mu (ln-bytes)",
-    )
-    parser.add_argument(
-        "--payload-sigma",
-        type=float,
-        default=None,
-        help="Override payload_log_sigma",
-    )
-    parser.add_argument(
-        "--traffic-zb",
-        type=float,
-        default=None,
-        help="Override global traffic (ZB/year)",
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--draws", type=int, default=10_000)
+    parser.add_argument("--seed", type=int, default=RNG_SEED)
+    parser.add_argument("--traffic-zb", type=float, default=8.8)
     parser.add_argument(
         "--storage-cost",
         type=float,
-        default=None,
-        help="Override baseline storage cost ($/TB-year)",
+        default=REFERENCE_USD_PER_TB_YEAR,
+        help="USD per decimal TB-year",
     )
+    parser.add_argument(
+        "--retention-ratio",
+        type=float,
+        default=1.0,
+        help="archived bytes / selected observed bytes",
+    )
+    parser.add_argument("--outdir", type=Path, default=Path("analysis/figures"))
+    parser.add_argument("--results-dir", type=Path, default=Path("analysis/results"))
     args = parser.parse_args()
-
-    repo_root = Path(__file__).resolve().parent.parent
-    outdir = repo_root / args.outdir
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    cfg = MCConfig(n_draws=args.draws)
-    if args.payload_mu is not None:
-        cfg.payload_log_mu = args.payload_mu
-    if args.payload_sigma is not None:
-        cfg.payload_log_sigma = args.payload_sigma
-    if args.traffic_zb is not None:
-        cfg.global_traffic_zb_year = args.traffic_zb
-    if args.storage_cost is not None:
-        cfg.storage_cost_tb_year = args.storage_cost
-
-    rng = np.random.default_rng(args.seed)
-
-    print(f"Running Monte Carlo with {cfg.n_draws:,} draws (seed={args.seed})...")
-    results = run_monte_carlo(cfg, rng)
-
-    plot_annual_cost_violin(results, outdir)
-    plot_cumulative_cost_shaded(results, outdir)
-    print_summary_table(results)
+    cfg = MCConfig(
+        n_draws=args.draws,
+        global_traffic_zb_year=args.traffic_zb,
+        storage_cost_tb_year=args.storage_cost,
+        retention_ratio=args.retention_ratio,
+    )
+    results = run_monte_carlo(cfg, np.random.default_rng(args.seed))
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    args.results_dir.mkdir(parents=True, exist_ok=True)
+    plot_cumulative_cost_shaded(results, args.outdir)
+    rows = summary_rows(results)
+    with (args.results_dir / "mc_storage_summary.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    metadata = {
+        "seed": args.seed,
+        "config": asdict(cfg),
+        "numpy_version": np.__version__,
+        "bit_generator": "PCG64",
+        "units": "decimal TB; nominal USD; 365-day years",
+        "accounting": "whole cohort charged in acquisition year; common horizon",
+        "price_source": "https://aws.amazon.com/s3/pricing/",
+        "price_checked": "2026-09-28",
+        "billing_gib_month_usd": 0.00099,
+    }
+    (args.results_dir / "mc_storage_config.json").write_text(
+        json.dumps(metadata, indent=2) + "\n"
+    )
+    for row in rows:
+        if row["fraction"] == 0.01:
+            print(
+                f"1% harvest, {row['years']:2d} year(s): median {row['median_usd']/1e9:.3f} B USD; "
+                f"P5–P95 {row['p05_usd']/1e9:.3f}–{row['p95_usd']/1e9:.3f}"
+            )
 
 
 if __name__ == "__main__":

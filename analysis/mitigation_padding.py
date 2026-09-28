@@ -131,7 +131,7 @@ def capture_tls13_padded(
     )
     t_srv_out = threading.Thread(
         target=reader_thread,
-        args=(server.stdout, logs_dir / "srv_out.log", "server", eph_store),
+        args=(server.stdout, logs_dir / "srv_out.log", "server", eph_store, server_accept_event),
     )
     t_srv_err = threading.Thread(
         target=reader_thread,

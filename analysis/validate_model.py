@@ -6,6 +6,7 @@ then overlays measured α on the theoretical curves from cost_analysis.py.
 """
 
 import argparse
+import csv
 import os
 import subprocess
 import sys
@@ -150,7 +151,7 @@ def _capture_tls_controlled(
     )
     t_srv_out = threading.Thread(
         target=reader_thread,
-        args=(server.stdout, logs_dir / "srv_out.log", "server", eph_store),
+        args=(server.stdout, logs_dir / "srv_out.log", "server", eph_store, server_accept_event),
     )
     t_srv_err = threading.Thread(
         target=reader_thread,
@@ -489,16 +490,22 @@ def plot_validation(
 ):
     payloads = np.logspace(2, 8, 300)
 
-    fig, ax = plt.subplots(figsize=(11, 6))
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
     _style_ax(ax)
 
-    # Theoretical curves
+    display_names = {
+        "tls12_rsa": "TLS 1.2 RSA",
+        "tls13_1rtt": "TLS 1.3",
+        "ssh_x25519": "SSH",
+        "quic_x25519": "QUIC",
+    }
+    # Accounting curves; measured markers share the protocol colour.
     for p in protocols:
         alphas = [p.alpha(x) for x in payloads]
         ax.plot(
             payloads,
             alphas,
-            label=p.name,
+            label=display_names.get(p.label, p.name),
             color=p.color,
             linestyle=p.linestyle,
             linewidth=2.0,
@@ -510,7 +517,7 @@ def plot_validation(
         payloads[-1] * 0.6,
         1.12,
         r"$\alpha = 1$ (no overhead)",
-        fontsize=13,
+        fontsize=10,
         color="grey",
         ha="right",
     )
@@ -522,8 +529,6 @@ def plot_validation(
         QUIC_X25519.label: ("v", QUIC_X25519.color),
         SSH_X25519.label: ("^", SSH_X25519.color),
     }
-    proto_by_label = {p.label: p for p in protocols}
-
     for label, pts in empirical.items():
         if not pts:
             continue
@@ -539,7 +544,7 @@ def plot_validation(
             zorder=5,
             edgecolors="black",
             linewidths=0.6,
-            label=f"{proto_by_label[label].name} (measured)",
+            label="_nolegend_",
         )
 
     ax.set_xscale("log")
@@ -551,20 +556,20 @@ def plot_validation(
         r"Protocol overhead ratio $\alpha$", fontweight="bold", fontsize=15, labelpad=15
     )
     ax.set_title(
-        r"Protocol overhead ratio $\alpha$: theory vs. experiment",
+        r"Protocol overhead ratio $\alpha$: model vs. captures",
         fontweight="bold",
-        fontsize=19,
+        fontsize=15,
         pad=15,
     )
     ax.set_xlim(payloads[0], payloads[-1])
     ax.set_ylim(0.9, 300)
 
-    # Two-column legend: curves first, then scatter
+    # One legend entry per protocol; the caption explains lines and markers.
     handles, labels_leg = ax.get_legend_handles_labels()
     ax.legend(
         handles,
         labels_leg,
-        fontsize=13,
+        fontsize=12,
         loc="upper right",
         framealpha=0.9,
         edgecolor="black",
@@ -717,8 +722,18 @@ def main():
             except Exception:
                 pass
 
+    with (outdir / "model_validation.csv").open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["protocol", "payload_bytes", "captured_frame_bytes", "alpha_measured", "alpha_model"])
+        models = {model.label: model for model in PROTOCOLS}
+        for label, points in empirical.items():
+            for payload, total, alpha in points:
+                writer.writerow([label, payload, total, alpha, models[label].alpha(payload)])
     print_summary(empirical, PROTOCOLS)
-    plot_validation(empirical, PROTOCOLS, outdir)
+    if any(len(empirical.get(label, [])) != len(payload_sizes) for label in args.protocols):
+        raise RuntimeError("incomplete capture sweep; see model_validation.csv and capture logs")
+    selected_models = [model for model in PROTOCOLS if model.label in empirical]
+    plot_validation(empirical, selected_models, outdir)
 
 
 if __name__ == "__main__":

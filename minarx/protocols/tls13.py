@@ -2,8 +2,8 @@
 
 The complete record fragments are retained.  An online collector cannot hash
 the encrypted post-ServerHello transcript, so replacing it with a final digest
-would be unsound.  HelloRetryRequest is rejected by the exercised-mode marker
-rather than silently treated as an ordinary ServerHello transcript.
+would be unsound.  HelloRetryRequest is rejected by its special ServerHello random rather than
+silently treated as an ordinary ServerHello transcript.
 """
 
 from pathlib import Path
@@ -66,7 +66,11 @@ def compact(capture_dir: Path, mode: str, port: int, profile: ProtocolProfile):
         {
             "policy": "tls-records-complete-transcript",
             "hello_retry_request": "outside-exercised-matrix",
-            "future_recovery_input": "server X25519 private scalar; peer public share is reconstructed from the archive",
+            "future_recovery_input": (
+                "external PSK supplied separately"
+                if mode == "external-psk"
+                else "server X25519 private scalar(s); peer public shares and ticket state are reconstructed from the archive"
+            ),
             "captures": measurements,
         },
     )

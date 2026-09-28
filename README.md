@@ -92,7 +92,7 @@ record exact byte counts, source and implementation hashes, and the evidence
 boundary. The compact result is an achieved sufficient representation for the
 controlled application marker, not a proof of a universal minimum.
 
-MinARX is the stricter protocol-aware minimal archive used for the paper's
+MinARX is the protocol-aware sufficient archive used for the paper's
 byte table. It separates a compressible protocol-layout region from verbatim
 protected/application bytes, reconstructs decoder-compatible PCAPs, and keeps
 future-recovery material outside the archive and its byte count:
@@ -222,8 +222,8 @@ IP, TCP, and UDP headers are never stored in the archive, are excluded from its
 byte count, and are deleted after recovery. Compact pruning is conservative:
 TLS 1.3 ciphertext is retained when its handshake/application role is not
 visible at collection time, QUIC retains bytes needed for header protection,
-and SSH retains direction-separated ciphertext streams because packet lengths
-are encrypted. Consequently compact output need not be smaller than
+and SSH retains direction-separated streams because the tested ChaCha20 cipher
+encrypts packet lengths. Consequently compact output need not be smaller than
 reassembled output for every small capture.
 
 The public Python API uses `ExperimentConfig`, `CaptureResult`, and
@@ -291,9 +291,9 @@ and excludes pure TCP ACKs while retaining UDP frames. The analytical storage
 curves are engineering models calibrated to the stated capture policy; they
 are not information-theoretic lower bounds. `analysis/monte_carlo_cost.py`
 charges the full retained inventory at each calendar year's recurring unit
-price (or only new media in explicit CapEx mode).
+price. Its inputs are observed traffic bytes, not application plaintext.
 
-The checked-in CSV files under `analysis/results/` are prior measurements, not
+The capture CSV files under `analysis/results/` are prior measurements, not
 generated fixtures. Regenerate them after capture-harness or model changes
 before using their numerical values in the paper; the scripts fail rather than
 silently recording zero-byte captures when dumpcap cannot read the interface
@@ -305,6 +305,43 @@ from a private, short-lived directory under `/tmp`. The original PCAP remains
 the evidence artifact and is never modified; auxiliary key logs are staged
 with mode `0600` only for that subprocess invocation.
 
+## Reproduce the storage and quantum-work scenarios
+
+From this repository root, with the analysis dependencies installed:
+
+~~~bash
+python3 analysis/monte_carlo_cost.py --outdir analysis/figures
+python3 analysis/quantum_work.py
+python3 analysis/plot_rekey_counts.py --outdir analysis/figures
+python3 -m pytest tests/test_cost_models.py
+~~~
+
+The Monte Carlo command writes one figure, a percentile CSV, and its complete
+configuration to analysis/results/. It uses 10,000 draws and seed 42. Traffic
+units are decimal. The reference USD 0.00099 per billing GiB-month converts to
+USD 11.0641 per decimal TB-year. Every retained cohort pays the current calendar
+year's price. New cohorts receive a full acquisition-year charge and remain
+until the common horizon. Rates are drawn once per scenario and held fixed;
+percentiles describe the chosen scenarios, not forecast confidence.
+
+The baseline retains one archived byte per selected observed byte. Use
+--retention-ratio to explore another archive policy, --traffic-zb for a
+different annual traffic reference, or --storage-cost for a different decimal
+TB-year price. Application-payload overhead is not applied to observed traffic.
+The model excludes interception, retrieval, request charges, object metadata,
+extra copies, and quantum hardware. The old media-purchase branch is removed:
+one-time media purchases are not comparable to recurring capacity charges.
+
+The quantum accounting CSV compares 37 independent jobs with a chain of
+37 dependent recoveries, as in passive SSH rekey recovery. Times are normalized
+to one job, not predicted hours on future hardware. The rekey plot marks
+recorded SSH counts without fitting a plaintext threshold to RekeyLimit.
+Its TLS step curves follow the configured application byte intervals.
+
+To reproduce the manuscript figures in the enclosing research workspace,
+pass --outdir ../paper/figures/review_2 to the storage and rekey plot commands. The original
+submission's figures remain separate.
+
 ## Formatting
 
 ```bash
@@ -314,6 +351,6 @@ black .
 Install the development tools and run the fast published tests with:
 
 ```bash
-python3 -m pip install -e '.[dev]'
+python3 -m pip install -e '.[dev,analysis]'
 python3 -m unittest discover -s tests -v
 ```

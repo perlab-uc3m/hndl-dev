@@ -448,6 +448,34 @@ class MinArxTests(unittest.TestCase):
                     self.assertEqual(container.opaque, plain_container.opaque)
                     self.assertEqual(container.layout, plain_container.layout)
 
+    def test_tls13_hello_retry_request_is_rejected(self):
+        client_hello, server_hello = _tls13_hellos(b"C" * 32, b"S" * 32)
+        retry_random = bytes.fromhex(
+            "CF21AD74E59A6111BE1D8C021E65B891C2A211167ABB8C5E079E09E2C8A8339C"
+        )
+        extensions = _extension(43, bytes.fromhex("0304")) + _extension(
+            51, bytes.fromhex("001d")
+        )
+        retry = _handshake(
+            2,
+            bytes.fromhex("0303") + retry_random + bytes.fromhex("00130100")
+            + len(extensions).to_bytes(2, "big") + extensions,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture = self._capture(
+                root,
+                "tls13_1rtt.pcapng",
+                [Chunk(0, _record(22, client_hello)),
+                 Chunk(1, _record(22, retry)),
+                 Chunk(0, _record(22, client_hello)),
+                 Chunk(1, _record(22, server_hello))],
+                "tcp",
+                44443,
+            )
+            with self.assertRaisesRegex(ArchiveError, "HelloRetryRequest"):
+                compact_capture(capture, root / "retry.minarx", "tls13", "1rtt", 44443)
+
     def test_profile_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
