@@ -395,7 +395,7 @@ def plot_padding_alpha(results, outdir: Path):
         pad=15,
     )
     ax.set_xlim(50, 2e6)
-    ax.set_ylim(0.9, 500)
+    ax.set_ylim(0.9, 3000)
     ax.legend(fontsize=13, loc="upper right", framealpha=0.9, edgecolor="black")
 
     fig.tight_layout()

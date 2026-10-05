@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Effective quantum multiplier under partial transcript extraction.
+"""Required key recoveries for a plaintext prefix.
 
 E_eff(L, R) = ceil(L / R) when the adversary targets only the first L
 bytes.  Generates a heatmap across realistic (L, R) combinations.
@@ -37,7 +37,7 @@ def _fmt_bytes(x, _=None):
     if x >= 1e6:
         return f"{x / 1e6:.0f} MB"
     if x >= 1e3:
-        return f"{x / 1e3:.0f} KB"
+        return f"{x / 1e3:.0f} kB"
     return f"{x:.0f} B"
 
 
@@ -45,7 +45,7 @@ def generate_figure(outdir: Path) -> Path:
     """Heatmap of E_eff(L, R) with contour overlay."""
 
     # -----------------------------------------------------------------------
-    # Axis ranges.  R_min = 2 KB (per-rekey overhead floor).
+    # Axis ranges.  R_min = 2 kB (per-rekey overhead floor).
     # L_min = 500 B (minimum meaningful adversary target).
     # -----------------------------------------------------------------------
     R_MIN = 2e3
@@ -134,10 +134,10 @@ def generate_figure(outdir: Path) -> Path:
 
     # Mark realistic adversary targets
     targets = [
-        (4_000, "credentials\n(4 KB)"),
-        (16_000, "first HTTP\nrequest\n(16 KB)"),
-        (64_000, "first DB\nquery\n(64 KB)"),
-        (256_000, "first page\nload\n(256 KB)"),
+        (4_000, "credentials\n(4 kB)"),
+        (16_000, "first HTTP\nrequest\n(16 kB)"),
+        (64_000, "first DB\nquery\n(64 kB)"),
+        (256_000, "first page\nload\n(256 kB)"),
     ]
     for L_target, label in targets:
         ax.axvline(x=L_target, color="white", linewidth=0.6, alpha=0.5)
@@ -157,7 +157,7 @@ def generate_figure(outdir: Path) -> Path:
     ax.text(
         L_MIN * 1.3,
         3000 * 1.15,
-        "per-rekey overhead ($\\approx$3 KB)",
+        "per-rekey overhead ($\\approx$3 kB)",
         fontsize=10,
         color="black",
         fontstyle="italic",
@@ -177,7 +177,7 @@ def generate_figure(outdir: Path) -> Path:
     ax.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_bytes))
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_bytes))
 
-    # Ensure the y-axis starting value (2 KB) appears as a labelled tick
+    # Ensure the y-axis starting value (2 kB) appears as a labelled tick
     default_yticks = [t for t in ax.get_yticks() if R_MIN < t <= R_MAX]
     ax.set_yticks([R_MIN] + default_yticks)
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_bytes))

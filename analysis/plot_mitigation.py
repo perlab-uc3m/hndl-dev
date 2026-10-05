@@ -155,7 +155,7 @@ TLS_MARKERS = {10_000: "s", 100_000: "o", 1_000_000: "P"}
 
 
 def plot_unified_E(rekey_data, psk_data, outdir: Path, tls_rot_data=None):
-    """Unified quantum cost multiplier E(P) for SSH rekey + TLS 1.3 PSK-DHE."""
+    """Fresh key-exchange count E(P) for SSH rekey + TLS 1.3 PSK-DHE."""
 
     payloads = np.logspace(2, 7.2, 500)
 
@@ -240,7 +240,7 @@ def plot_unified_E(rekey_data, psk_data, outdir: Path, tls_rot_data=None):
         color="#888888",
         linewidth=2,
         linestyle=":",
-        label="TLS 1.3 KeyUpdate (E=1 always)",
+        label="Full ECDHE + KeyUpdate (E=1)",
         zorder=1,
     )
 
@@ -251,13 +251,13 @@ def plot_unified_E(rekey_data, psk_data, outdir: Path, tls_rot_data=None):
         "Application payload per session (bytes)", fontweight="bold", fontsize=15
     )
     ax.set_ylabel(
-        "Independent DH / ECDHE exchanges (E)",
+        "Fresh DH / ECDHE exchanges (E)",
         fontweight="bold",
         fontsize=15,
         labelpad=15,
     )
     ax.set_title(
-        "Quantum cost multiplier: SSH rekeying vs. TLS 1.3 PSK-DHE rotation",
+        "Fresh key exchanges: SSH rekeying vs. TLS 1.3 PSK-DHE rotation",
         fontweight="bold",
         fontsize=17,
         pad=15,
@@ -296,12 +296,12 @@ def compute_summary_table(padding_data, rekey_data, psk_data):
     if r100:
         rows.append(
             {
-                "mitigation": "TLS 1.3 record padding (16\\,KB block)",
+                "mitigation": "TLS 1.3 record padding (16\\,KiB block)",
                 "axis": r"$\alpha$ (storage)",
                 "parameter": "100\\,B payload",
                 "inflation": f"$\\alpha$: {baseline_alpha.get(100, 0):.1f}$\\times$ $\\to$ "
                 f"{r100[0]['alpha']:.0f}$\\times$",
-                "overhead": "+16\\,KB/record",
+                "overhead": "+16\\,KiB/record",
             }
         )
 
@@ -310,7 +310,7 @@ def compute_summary_table(padding_data, rekey_data, psk_data):
     if r1m:
         rows.append(
             {
-                "mitigation": "TLS 1.3 record padding (16\\,KB block)",
+                "mitigation": "TLS 1.3 record padding (16\\,KiB block)",
                 "axis": r"$\alpha$ (storage)",
                 "parameter": "1\\,MB payload",
                 "inflation": f"$\\alpha$: {baseline_alpha.get(1_000_000, 0):.3f}$\\times$ $\\to$ "
@@ -332,10 +332,10 @@ def compute_summary_table(padding_data, rekey_data, psk_data):
         rows.append(
             {
                 "mitigation": "SSH rekey (\\texttt{RekeyLimit 64K})",
-                "axis": "$E$ (quantum)",
+                "axis": "$E$ (exchanges)",
                 "parameter": "1\\,MB transfer",
                 "inflation": f"$E$: 1 $\\to$ {r['E']}",
-                "overhead": f"+{oh_bytes/1000:.1f}\\,KB ({oh_pct:.1f}\\%)",
+                "overhead": f"+{oh_bytes/1000:.1f}\\,kB ({oh_pct:.1f}\\%)",
             }
         )
 
@@ -349,10 +349,10 @@ def compute_summary_table(padding_data, rekey_data, psk_data):
         rows.append(
             {
                 "mitigation": "SSH rekey (\\texttt{RekeyLimit 64K})",
-                "axis": "$E$ (quantum)",
+                "axis": "$E$ (exchanges)",
                 "parameter": "5\\,MB transfer",
                 "inflation": f"$E$: 1 $\\to$ {r['E']}",
-                "overhead": f"+{oh_bytes/1000:.1f}\\,KB ({oh_pct:.1f}\\%)",
+                "overhead": f"+{oh_bytes/1000:.1f}\\,kB ({oh_pct:.1f}\\%)",
             }
         )
 
@@ -364,8 +364,8 @@ def compute_summary_table(padding_data, rekey_data, psk_data):
         oh_pct = (r["inflation"] - 1) * 100
         rows.append(
             {
-                "mitigation": "TLS 1.3 PSK-DHE rotation (100\\,KB)",
-                "axis": "$E$ (quantum)",
+                "mitigation": "TLS 1.3 PSK-DHE rotation (100\\,kB)",
+                "axis": "$E$ (exchanges)",
                 "parameter": "1\\,MB transfer",
                 "inflation": f"$E$: 1 $\\to$ {r['E']}",
                 "overhead": f"{oh_pct:.1f}\\% storage inflation",
@@ -379,8 +379,8 @@ def compute_summary_table(padding_data, rekey_data, psk_data):
         oh_pct = (r["inflation"] - 1) * 100
         rows.append(
             {
-                "mitigation": "TLS 1.3 PSK-DHE rotation (10\\,KB)",
-                "axis": "$E$ (quantum)",
+                "mitigation": "TLS 1.3 PSK-DHE rotation (10\\,kB)",
+                "axis": "$E$ (exchanges)",
                 "parameter": "5\\,MB transfer",
                 "inflation": f"$E$: 1 $\\to$ {r['E']}",
                 "overhead": f"{oh_pct:.1f}\\% storage inflation",
@@ -391,7 +391,7 @@ def compute_summary_table(padding_data, rekey_data, psk_data):
     rows.append(
         {
             "mitigation": "TLS 1.3 \\texttt{KeyUpdate}",
-            "axis": "$E$ (quantum)",
+            "axis": "$E$ (exchanges)",
             "parameter": "Any",
             "inflation": "$E$: 1 $\\to$ 1 (no effect)",
             "overhead": "None",

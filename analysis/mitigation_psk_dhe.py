@@ -85,7 +85,7 @@ PAYLOAD_SIZES = [
     5_000_000,
 ]
 
-# Rotation data-transfer experiment: (R, P) sweep for validating E = ceil(P/R).
+# Rotation data-transfer experiment: (R, P) sweep checking PSK-DHE in the scheduled ceil(P/R) connections.
 ROTATION_INTERVALS_EXP = [
     ("10K", 10_000),
     ("100K", 100_000),
@@ -480,7 +480,7 @@ def capture_rotated_transfer(
     verbose: bool,
     tmp_dir: Path,
 ) -> tuple[int, int]:
-    """Run E = ceil(P/R) sequential PSK-DHE connections, each fetching R bytes.
+    """Run E = ceil(P/R) sequential PSK-DHE connections, each fetching min(R, remaining) bytes.
 
     Returns (pcap_total_bytes, E_measured).
     """
@@ -598,12 +598,25 @@ def capture_rotated_transfer(
 
     total_bytes = pcap_total_bytes(pcap_file)
     E_measured = count_client_hellos(pcap_file, keylog_file)
-    psk_resumptions = count_handshakes_with_extension(pcap_file, 1, 41)
+    psk_resumptions = count_handshakes_with_extension(pcap_file, 2, 41)
     dhe_handshakes = count_handshakes_with_extension(pcap_file, 2, 51)
-    if psk_resumptions != max(0, E_expected - 1) or dhe_handshakes != E_expected:
+    shares_result = run_tshark(
+        ["tshark", "-r", str(pcap_file), "-Y", "tls.handshake.type==2",
+         "-T", "fields", "-e", "tls.handshake.extensions_key_share_key_exchange"],
+        pcap_file,
+    )
+    if shares_result.returncode != 0:
+        raise RuntimeError(shares_result.stderr or "tshark failed checking key shares")
+    shares = [line.strip() for line in shares_result.stdout.splitlines() if line.strip()]
+    if (E_measured != E_expected
+            or psk_resumptions != max(0, E_expected - 1)
+            or dhe_handshakes != E_expected
+            or len(shares) != E_expected
+            or len(set(shares)) != E_expected):
         raise RuntimeError(
-            "rotation was not an initial handshake followed by PSK-DHE: "
-            f"PSK resumptions={psk_resumptions}, DHE handshakes={dhe_handshakes}"
+            "rotation was not an initial handshake followed by PSK-DHE with fresh shares: "
+            f"hellos={E_measured}, accepted PSKs={psk_resumptions}, "
+            f"DHE handshakes={dhe_handshakes}, distinct shares={len(set(shares))}"
         )
 
     return total_bytes, E_measured
@@ -774,7 +787,7 @@ def plot_psk_dhe(h_init, h_resum, outdir: Path, rot_results=None):
         "Independent ECDHE exchanges (E)", fontweight="bold", fontsize=15, labelpad=15
     )
     ax2.set_title(
-        "TLS 1.3 PSK-DHE rotation: quantum cost multiplier E",
+        "TLS 1.3 PSK-DHE rotation: fresh key exchanges E",
         fontweight="bold",
         fontsize=17,
         pad=15,

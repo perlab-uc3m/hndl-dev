@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Storage-cost model for HN-DL attacks.
+"""Per-session protocol overhead model for HN-DL captures.
 
 Computes the protocol overhead ratio α = bytes_stored / bytes_plaintext
 for TLS 1.2, TLS 1.3, QUIC, and SSH across a range of payload sizes.
+Global retention costs use storage_model.py and monte_carlo_cost.py; compact
+archive measurements use scripts/minarx_experiment.py and retain authentication tags.
 """
 
 import argparse
@@ -201,15 +203,6 @@ QUIC_X25519 = ProtocolModel(
 
 PROTOCOLS = [TLS12_RSA, TLS12_ECDHE, TLS13_1RTT, QUIC_X25519, SSH_X25519]
 
-# ---------------------------------------------------------------------------
-# Global traffic parameters (for Plot 2)
-# ---------------------------------------------------------------------------
-
-GLOBAL_ENCRYPTED_TRAFFIC_PB_PER_DAY = 10_400  # ~3.8 ZB/year ÷ 365
-AVERAGE_SESSION_PAYLOAD = 2e6  # 2 MB
-SESSIONS_PER_DAY = GLOBAL_ENCRYPTED_TRAFFIC_PB_PER_DAY * 1e15 / AVERAGE_SESSION_PAYLOAD
-
-
 def _style_ax(ax):
     ax.grid(True, linestyle="--", which="both", color="grey", alpha=0.4)
     ax.set_axisbelow(True)
@@ -271,71 +264,6 @@ def plot_amplification(protocols, outdir: Path):
     return outpath
 
 
-def plot_global_storage(protocols, outdir: Path):
-    """Daily storage cost at global scale."""
-    harvest_fractions = [
-        (0.01, "1%", "-", 2.0),
-        (0.10, "10%", "--", 1.8),
-        (1.00, "100%", ":", 1.5),
-    ]
-    session_payloads = np.logspace(3, 7, 200)  # 1 KB to 10 MB
-
-    fig, ax = plt.subplots(figsize=(11, 6))
-    _style_ax(ax)
-
-    for p in protocols:
-        for frac, frac_label, ls, lw in harvest_fractions:
-            n_sessions = SESSIONS_PER_DAY * frac
-            daily_pb = np.array(
-                [p.session_bytes(sp) * n_sessions / 1e15 for sp in session_payloads]
-            )
-            # Only label once per protocol (use the first fraction)
-            label = f"{p.name}" if frac == harvest_fractions[0][0] else None
-            ax.plot(
-                session_payloads,
-                daily_pb,
-                color=p.color,
-                linestyle=ls,
-                linewidth=lw,
-                label=label,
-                alpha=0.85,
-            )
-
-    # Add annotations for the harvest fraction bands
-    # Annotate at the right edge, mid-protocol
-    ref_proto = PROTOCOLS[0]
-    for frac, frac_label, _, _ in harvest_fractions:
-        n_sessions = SESSIONS_PER_DAY * frac
-        y_val = ref_proto.session_bytes(session_payloads[-1]) * n_sessions / 1e15
-        ax.annotate(
-            f"Harvest {frac_label}",
-            xy=(session_payloads[-1], y_val),
-            fontsize=12,
-            fontweight="bold",
-            color="#444444",
-            ha="right",
-            va="bottom",
-            xytext=(-5, 5),
-            textcoords="offset points",
-        )
-
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Average session payload (bytes)", fontweight="bold", fontsize=15)
-    ax.set_ylabel("Daily storage (PB)", fontweight="bold", fontsize=15, labelpad=15)
-    ax.set_title(
-        "Daily HN-DL storage at global scale", fontweight="bold", fontsize=19, pad=15
-    )
-    ax.legend(fontsize=14, loc="upper left", framealpha=0.9, edgecolor="black")
-
-    fig.tight_layout()
-    outpath = outdir / "global_storage_cost.pdf"
-    fig.savefig(outpath, dpi=300, bbox_inches="tight")
-    print(f"[+] Saved: {outpath}")
-    plt.close(fig)
-    return outpath
-
-
 def validate_against_pcaps(protocols, data_dir: Path):
     """Quick single-point check against existing PCAPs (full sweep in validate_model.py)."""
     pcap_map: dict[str, tuple[str, str, int]] = {
@@ -381,7 +309,7 @@ def print_summary_table(protocols):
     print("\n=== Protocol Parameters ===")
     print(
         f"{'Protocol':<22} {'HS (B)':>8} {'Rec hdr':>8} {'AEAD tag':>8} "
-        f"{'α(1KB)':>8} {'α(100KB)':>8} {'α(10MB)':>8}"
+        f"{'α(1kB)':>8} {'α(100kB)':>8} {'α(10MB)':>8}"
     )
     print("-" * 78)
     for p in protocols:
@@ -393,112 +321,6 @@ def print_summary_table(protocols):
             f"{a1k:>8.1f} {a100k:>8.2f} {a10m:>8.3f}"
         )
 
-    print(
-        f"\n=== Global Daily Storage (avg payload = {AVERAGE_SESSION_PAYLOAD/1e6:.0f} MB) ==="
-    )
-    print(f"Sessions/day: {SESSIONS_PER_DAY:.2e}")
-    for frac_label, frac in [("1%", 0.01), ("10%", 0.10), ("100%", 1.00)]:
-        n = SESSIONS_PER_DAY * frac
-        print(f"\n  Harvest fraction: {frac_label} ({n:.2e} sessions/day)")
-        for p in protocols:
-            daily_bytes = p.session_bytes(AVERAGE_SESSION_PAYLOAD) * n
-            daily_pb = daily_bytes / 1e15
-            daily_eb = daily_bytes / 1e18
-            print(
-                f"    {p.name:<22} {daily_pb:>10,.1f} PB/day  ({daily_eb:>6.3f} EB/day)"
-            )
-
-
-def verify_minimal_archive():
-    """Verify per-record overhead claims from the minimal-archive appendix."""
-    print("\n=== Minimal-Archive Analysis (Appendix verification) ===\n")
-
-    # Per-protocol parameters: (name, ω, ω_min, M)
-    # ω     = full per-record wire overhead (bytes beyond payload ciphertext)
-    # ω_min = minimal per-record overhead after stripping tags + constants
-    # M     = maximum record payload size
-    specs = [
-        # TLS 1.3: header 5B (3B constant + 2B length) + inner content type 1B + tag 16B = 22B
-        #          ω_min: length 2B + inner content type 1B = 3B
-        ("TLS 1.3", 22, 3, TLS_MAX_RECORD),
-        # SSH: record_header 4B + avg padding overhead 8.5B + tag 16B = 28.5B
-        #      ω_min: record_header 4B + avg padding overhead 8.5B = 12.5B
-        ("SSH", 28.5, 12.5, SSH_MAX_PACKET),
-        # QUIC: short header 11B + tag 16B = 27B
-        #       ω_min: short header 11B = 11B
-        ("QUIC", 27, 11, QUIC_MAX_DATAGRAM_PAYLOAD),
-    ]
-
-    print(
-        f"  {'Protocol':<10} {'ω':>6} {'ω_min':>6} {'M':>7}"
-        f"  {'α_∞':>8} {'α_∞,min':>8} {'|Δα|':>10}"
-    )
-    print("  " + "-" * 60)
-
-    max_delta = 0.0
-    max_delta_tcp = 0.0
-    ok = True
-
-    for name, omega, omega_min, M in specs:
-        alpha_inf = 1 + omega / M
-        alpha_inf_min = 1 + omega_min / M
-        delta = abs(alpha_inf - alpha_inf_min)
-
-        is_tcp = name != "QUIC"
-        max_delta = max(max_delta, delta)
-        if is_tcp:
-            max_delta_tcp = max(max_delta_tcp, delta)
-
-        print(
-            f"  {name:<10} {omega:>6.1f} {omega_min:>6.1f} {M:>7}"
-            f"  {alpha_inf:>8.4f} {alpha_inf_min:>8.4f} {delta:>10.2e}"
-        )
-
-    # Verify paper claims
-    print()
-
-    # Claim 1: paper Table states specific ω, ω_min, α_∞, α_{∞,min} values
-    checks = [
-        ("TLS 1.3 α_∞ ≈ 1.0013", abs(1 + 22 / TLS_MAX_RECORD - 1.0013) < 5e-5),
-        ("TLS 1.3 α_∞,min ≈ 1.0002", abs(1 + 3 / TLS_MAX_RECORD - 1.0002) < 5e-5),
-        ("SSH α_∞ ≈ 1.0009", abs(1 + 28.5 / SSH_MAX_PACKET - 1.0009) < 5e-5),
-        ("SSH α_∞,min ≈ 1.0004", abs(1 + 12.5 / SSH_MAX_PACKET - 1.0004) < 5e-5),
-        ("QUIC α_∞ ≈ 1.020", abs(1 + 27 / QUIC_MAX_DATAGRAM_PAYLOAD - 1.020) < 5e-4),
-        (
-            "QUIC α_∞,min ≈ 1.008",
-            abs(1 + 11 / QUIC_MAX_DATAGRAM_PAYLOAD - 1.008) < 5e-4,
-        ),
-        # Claim 2: max |Δα| = 1.2e-2 (QUIC)
-        (
-            "|Δα| max (QUIC) = 1.2e-2",
-            abs(max_delta - 16 / QUIC_MAX_DATAGRAM_PAYLOAD) < 1e-6,
-        ),
-        # Claim 3: TCP-based |Δα| < 1.2e-3
-        ("TCP |Δα| < 1.2e-3", max_delta_tcp < 1.2e-3),
-        # Claim 4 (cost_analysis.tex): α_{∞,min} differs from α_∞ by < 1.2e-2
-        ("max |Δα| < 1.2e-2", max_delta < 1.2e-2),
-    ]
-
-    for desc, passed in checks:
-        status = "OK" if passed else "FAIL"
-        if not passed:
-            ok = False
-        print(f"  [{status}] {desc}")
-
-    # Print ω decomposition for cross-reference
-    print("\n  ω decomposition:")
-    print(f"    TLS 1.3: header(5) + inner_ct(1) + tag(16) = {5+1+16}")
-    print(
-        f"    SSH:     rec_hdr(4) + pad_len(1) + avg_pad(7.5) + tag(16) = {4+1+7.5+16}"
-    )
-    print(f"    QUIC:    short_hdr(1+8+2) + tag(16) = {11+16}")
-    print(f"\n  ω_min decomposition:")
-    print(f"    TLS 1.3: length(2) + inner_ct(1) = {2+1}")
-    print(f"    SSH:     rec_hdr(4) + pad_len(1) + avg_pad(7.5) = {4+1+7.5}")
-    print(f"    QUIC:    short_hdr(1+8+2) = {1+8+2}")
-
-    print(f"\n  All checks passed: {ok}")
-    return ok
 
 
 def main():
@@ -519,11 +341,9 @@ def main():
     data_dir = repo_root / args.data_dir
 
     plot_amplification(PROTOCOLS, outdir)
-    plot_global_storage(PROTOCOLS, outdir)
 
     validate_against_pcaps(PROTOCOLS, data_dir)
     print_summary_table(PROTOCOLS)
-    verify_minimal_archive()
 
 
 if __name__ == "__main__":

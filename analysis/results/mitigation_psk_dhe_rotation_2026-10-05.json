@@ -1,0 +1,163 @@
+{
+  "created_utc": "2026-10-05T18:01:29.865137+00:00",
+  "python": "3.14.4",
+  "openssl": "OpenSSL 3.6.0 1 Oct 2025 (Library: OpenSSL 3.6.0 1 Oct 2025)",
+  "source_sha256": "e8fc46394808b758486350ef963176a8e54486e34a0cc66d6a15edf2c8aa4ab1",
+  "policy": "Each connection fetches min(R, remaining payload) bytes; initial full handshake followed by PSK-DHE resumptions.",
+  "outcomes": [
+    {
+      "rotation_bytes": 10000,
+      "payload_bytes": 10000,
+      "exchanges": 1,
+      "server_key_share_handshakes_checked": 1,
+      "capture_sha256": "e60fdd2129e7b7a019a649fecf2eb3e656da3306dd9ba37f5485cdd3c192bc0f",
+      "client_psk_offers_checked": 0,
+      "server_psk_acceptances_checked": 0,
+      "distinct_server_key_shares_checked": 1
+    },
+    {
+      "rotation_bytes": 10000,
+      "payload_bytes": 50000,
+      "exchanges": 5,
+      "server_key_share_handshakes_checked": 5,
+      "capture_sha256": "d3bcd4fb4a082a691777578e544d80d40918264d564bc13b7df35934cb46e0da",
+      "client_psk_offers_checked": 4,
+      "server_psk_acceptances_checked": 4,
+      "distinct_server_key_shares_checked": 5
+    },
+    {
+      "rotation_bytes": 10000,
+      "payload_bytes": 100000,
+      "exchanges": 10,
+      "server_key_share_handshakes_checked": 10,
+      "capture_sha256": "47ccfdce6a842550caabfb4896365880d7fd3642f6706fc5f0fafd324eb1605b",
+      "client_psk_offers_checked": 9,
+      "server_psk_acceptances_checked": 9,
+      "distinct_server_key_shares_checked": 10
+    },
+    {
+      "rotation_bytes": 10000,
+      "payload_bytes": 500000,
+      "exchanges": 50,
+      "server_key_share_handshakes_checked": 50,
+      "capture_sha256": "a88ddd571d02caa6bfff6d038b59f74be8ec4cb0905823038815642bc91d7321",
+      "client_psk_offers_checked": 49,
+      "server_psk_acceptances_checked": 49,
+      "distinct_server_key_shares_checked": 50
+    },
+    {
+      "rotation_bytes": 10000,
+      "payload_bytes": 1000000,
+      "exchanges": 100,
+      "server_key_share_handshakes_checked": 100,
+      "capture_sha256": "a6bcf9299033e08cb1485ac7ba5179f637be18092a450bd9ddd612942dea3c7a",
+      "client_psk_offers_checked": 99,
+      "server_psk_acceptances_checked": 99,
+      "distinct_server_key_shares_checked": 100
+    },
+    {
+      "rotation_bytes": 100000,
+      "payload_bytes": 10000,
+      "exchanges": 1,
+      "server_key_share_handshakes_checked": 1,
+      "capture_sha256": "dfef9b25df373537b13cdf965f9b976ba7d942451dde9b9e698fc09262b1ef4f",
+      "client_psk_offers_checked": 0,
+      "server_psk_acceptances_checked": 0,
+      "distinct_server_key_shares_checked": 1
+    },
+    {
+      "rotation_bytes": 100000,
+      "payload_bytes": 50000,
+      "exchanges": 1,
+      "server_key_share_handshakes_checked": 1,
+      "capture_sha256": "cdae1f24f2fde227d4dc13ea34345563865eef1e6a23c9a03972a86fe548706e",
+      "client_psk_offers_checked": 0,
+      "server_psk_acceptances_checked": 0,
+      "distinct_server_key_shares_checked": 1
+    },
+    {
+      "rotation_bytes": 100000,
+      "payload_bytes": 100000,
+      "exchanges": 1,
+      "server_key_share_handshakes_checked": 1,
+      "capture_sha256": "d5a2f304ecb7f4ea4dfa589ac572821522fdc7d7f2122e5e2dde10e3198584d1",
+      "client_psk_offers_checked": 0,
+      "server_psk_acceptances_checked": 0,
+      "distinct_server_key_shares_checked": 1
+    },
+    {
+      "rotation_bytes": 100000,
+      "payload_bytes": 500000,
+      "exchanges": 5,
+      "server_key_share_handshakes_checked": 5,
+      "capture_sha256": "a9006fc2156583a18899e33de0455a391dca3b7494d33f1c72de7ab58495a871",
+      "client_psk_offers_checked": 4,
+      "server_psk_acceptances_checked": 4,
+      "distinct_server_key_shares_checked": 5
+    },
+    {
+      "rotation_bytes": 100000,
+      "payload_bytes": 1000000,
+      "exchanges": 10,
+      "server_key_share_handshakes_checked": 10,
+      "capture_sha256": "992ad90a91fdb524d458d722e0bdedee6572d984e013bd2307cb59404505349b",
+      "client_psk_offers_checked": 9,
+      "server_psk_acceptances_checked": 9,
+      "distinct_server_key_shares_checked": 10
+    },
+    {
+      "rotation_bytes": 1000000,
+      "payload_bytes": 10000,
+      "exchanges": 1,
+      "server_key_share_handshakes_checked": 1,
+      "capture_sha256": "e9181af5decee21eb9580f1de34916a82f449d94e0b103e1baf6d6f2f70a0c26",
+      "client_psk_offers_checked": 0,
+      "server_psk_acceptances_checked": 0,
+      "distinct_server_key_shares_checked": 1
+    },
+    {
+      "rotation_bytes": 1000000,
+      "payload_bytes": 50000,
+      "exchanges": 1,
+      "server_key_share_handshakes_checked": 1,
+      "capture_sha256": "0be84d5947e7e2c5f5e9e0e75bca8bfcab6597cb57820440ba0e00fab06f93af",
+      "client_psk_offers_checked": 0,
+      "server_psk_acceptances_checked": 0,
+      "distinct_server_key_shares_checked": 1
+    },
+    {
+      "rotation_bytes": 1000000,
+      "payload_bytes": 100000,
+      "exchanges": 1,
+      "server_key_share_handshakes_checked": 1,
+      "capture_sha256": "b3fc456ee0c4bb8bcaf68282d4105c4ee9f183a0f93eba52c2149a9fa5f36f32",
+      "client_psk_offers_checked": 0,
+      "server_psk_acceptances_checked": 0,
+      "distinct_server_key_shares_checked": 1
+    },
+    {
+      "rotation_bytes": 1000000,
+      "payload_bytes": 500000,
+      "exchanges": 1,
+      "server_key_share_handshakes_checked": 1,
+      "capture_sha256": "1fe8d7c8b414b47e5a5bb0c8acced0fd1bad1c331db8477d897a743dcd0d67fe",
+      "client_psk_offers_checked": 0,
+      "server_psk_acceptances_checked": 0,
+      "distinct_server_key_shares_checked": 1
+    },
+    {
+      "rotation_bytes": 1000000,
+      "payload_bytes": 1000000,
+      "exchanges": 1,
+      "server_key_share_handshakes_checked": 1,
+      "capture_sha256": "8f7281e09a01431627441dad660b71cf290c2fe39979fa03565c6f85036b28df",
+      "client_psk_offers_checked": 0,
+      "server_psk_acceptances_checked": 0,
+      "distinct_server_key_shares_checked": 1
+    }
+  ],
+  "baseline_commit": "4cd96284ffe398e1e02f39230f9762c3c3834c6e",
+  "verification": "ServerHello pre_shared_key extension confirms acceptance; ServerHello key_share values are distinct across every connection.",
+  "verification_source_sha256": "49e7be1b0bb1b3edd67115db913a2b6dc4437afaa06421de7f6cd94c33f91ff3",
+  "legacy_csv_sha256": "c31d84ef9249d2daccb99cb710feaf34f117fb5d6f106a0b8fd95bc3fa5720ae"
+}

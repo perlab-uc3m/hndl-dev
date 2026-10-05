@@ -451,7 +451,7 @@ def plot_rekey_alpha(results, outdir: Path):
         "Independent DH exchanges (E)", fontweight="bold", fontsize=15, labelpad=15
     )
     ax2.set_title(
-        "SSH rekeying: quantum cost multiplier E",
+        "SSH rekeying: fresh key exchanges E",
         fontweight="bold",
         fontsize=17,
         pad=15,

@@ -65,7 +65,7 @@ def plot_counts(results_dir, outdir):
         ax_tls.step(
             boundaries,
             counts,
-            where="post",
+            where="pre",
             color=color,
             linestyle="--",
             linewidth=1.2,
@@ -92,7 +92,7 @@ def plot_counts(results_dir, outdir):
 
     for ax, title in (
         (ax_ssh, "SSH: measured exchanges"),
-        (ax_tls, "TLS 1.3: model and measurements"),
+        (ax_tls, "TLS 1.3: scheduled and observed"),
     ):
         ax.axhline(1, color="0.5", linestyle=":", linewidth=0.9)
         ax.set_xscale("log")
