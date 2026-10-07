@@ -6,10 +6,11 @@ recovery checks. The 28 September files are an independent replication using
 new captures. Their sizes differ, notably for SSH and TLS 1.3 0-RTT; they do
 not replace the 22 September table values.
 
-The manuscript cites public commit
-`4cd96284ffe398e1e02f39230f9762c3c3834c6e`, which includes those reference
-results and the storage-model configuration. The corrections below postdate
-that snapshot and need a subsequent public revision to be available on GitHub.
+The manuscript cites release
+[`tifs-revision-2026-10-07`](https://github.com/perlab-uc3m/hndl-dev/releases/tag/tifs-revision-2026-10-07),
+which freezes the reference archive results, storage-model configuration,
+and corrected 5 October TLS rotation sweep. The earlier `4cd9628` snapshot
+contains the archive results but predates the rotation-data correction.
 
 ## TLS rotation correction, 5 October 2026
 

@@ -119,9 +119,10 @@ hash-bound JSON/CSV with raw capture, transport, opaque, layout, compression,
 and final archive byte counts. The checked reference run is
 `analysis/results/minarx_live_2026-09-22.{json,csv}`; this is the source of
 Table III. The 28 September files are an independent replication on different
-captures, not replacements for the table values. The paper cites the immutable
-[4cd9628 snapshot](https://github.com/perlab-uc3m/hndl-dev/tree/4cd96284ffe398e1e02f39230f9762c3c3834c6e).
-Later result corrections are described in [the results notes](analysis/results/README.md).
+captures, not replacements for the table values. The paper cites the frozen
+[TIFS revision](https://github.com/perlab-uc3m/hndl-dev/releases/tag/tifs-revision-2026-10-07).
+The release includes the corrected 5 October rotation sweep; provenance is
+described in [the results notes](analysis/results/README.md).
 Format semantics and the
 reason savings are trace-shape dependent are documented in
 `docs/minarx_format.md`.
